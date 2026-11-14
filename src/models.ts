@@ -77,14 +77,17 @@ function modelCostFor(publicId: string): ModelCost {
 function buildThinkingLevelMap(
   variants: Partial<Record<ThinkingLevel, string>>,
   unsuffixed?: string,
+  offRuntime?: string,
 ): ThinkingLevelMap {
   const hasVariants = Object.keys(variants).length > 0;
   return Object.fromEntries(
     UI_LEVELS.map((l) => [
       l,
-      l === "off" || l === "max"
-        ? null
-        : (variants[l] ?? (!hasVariants && l === "high" ? unsuffixed : undefined) ?? null),
+      l === "off"
+        ? (offRuntime ?? null)
+        : l === "max"
+          ? null
+          : (variants[l] ?? (!hasVariants && l === "high" ? unsuffixed : undefined) ?? null),
     ]),
   ) as ThinkingLevelMap;
 }
@@ -151,6 +154,8 @@ export function buildCatalog(
     publicId: string;
     variants: Partial<Record<ThinkingLevel, string>>;
     unsuffixed?: string;
+    nonThinkingRuntime?: string;
+    tieredRuntime?: string;
     displayNames: string[];
     supportsThinking?: boolean;
     supportsImages?: boolean;
@@ -181,7 +186,9 @@ export function buildCatalog(
       }
 
       const isTiered = runtimeId.endsWith("-tiered");
-      const suffix = isTiered ? null : runtimeId.match(/^(.+)-(extra-low|extra-high|xhigh|thinking|minimal|medium|high|low)$/i);
+      const suffix = isTiered
+        ? null
+        : runtimeId.match(/^(.+?)-(extra-low|extra-high|x-high|xhigh|thinking|minimal|medium|high|low)$/i);
       const publicId = isTiered ? runtimeId.slice(0, -"-tiered".length) : (suffix?.[1] ?? runtimeId);
 
       const g = groups.get(publicId) ?? { publicId, variants: {}, displayNames: [] };
@@ -195,12 +202,16 @@ export function buildCatalog(
       else if (info?.supportsImages === true && g.supportsImages === undefined) g.supportsImages = true;
 
       if (isTiered) {
+        g.tieredRuntime ??= runtimeId;
         g.unsuffixed ??= runtimeId;
       } else {
         const suffixLevel = suffix ? LEVEL_MAP[suffix[2]!.toLowerCase()] : undefined;
         const level = parseTrailingTier(displayName).level ?? suffixLevel;
         if (level) g.variants[level] = runtimeId;
-        else g.unsuffixed = runtimeId;
+        else {
+          g.unsuffixed = runtimeId;
+          if (info?.supportsThinking === false) g.nonThinkingRuntime = runtimeId;
+        }
       }
     }
     return groups;
@@ -212,6 +223,9 @@ export function buildCatalog(
 
   const models: Model<AntigravityApi>[] = [...groups.values()].map((g) => {
     const seed = FALLBACK_MODELS.find((m) => m.id === g.publicId);
+    if (g.tieredRuntime && Object.keys(g.variants).length === 0) {
+      g.variants = { low: g.tieredRuntime, medium: g.tieredRuntime, high: g.tieredRuntime };
+    }
     const hasVariants = Object.keys(g.variants).length > 0;
     const reasoning =
       g.supportsThinking === false ? false : hasVariants || g.supportsThinking === true || Boolean(seed?.reasoning);
@@ -222,7 +236,9 @@ export function buildCatalog(
         ? rawName
         : `${rawName} (Antigravity)`
       : (seed?.name ?? `${g.publicId} (Antigravity)`);
-    const needsRouteMap = reasoning || hasVariants || (g.unsuffixed !== undefined && g.unsuffixed !== g.publicId);
+    const offRuntime = hasVariants ? g.nonThinkingRuntime : undefined;
+    const needsRouteMap =
+      reasoning || hasVariants || Boolean(offRuntime) || (g.unsuffixed !== undefined && g.unsuffixed !== g.publicId);
 
     return {
       id: g.publicId,
@@ -231,7 +247,9 @@ export function buildCatalog(
       provider: PROVIDER_ID,
       baseUrl,
       reasoning,
-      ...(needsRouteMap ? { thinkingLevelMap: buildThinkingLevelMap(g.variants, g.unsuffixed ?? g.publicId) } : {}),
+      ...(needsRouteMap
+        ? { thinkingLevelMap: buildThinkingLevelMap(g.variants, g.unsuffixed ?? g.publicId, offRuntime) }
+        : {}),
       input: supportsImages ? ["text", "image"] : ["text"],
       cost: modelCostFor(g.publicId),
       contextWindow: g.contextWindow ?? seed?.contextWindow ?? 128_000,
@@ -246,6 +264,9 @@ export function buildCatalog(
 export function resolveRuntimeModel(model: Model<Api>, reasoning?: ModelThinkingLevel): string {
   const map = model.thinkingLevelMap;
   if (!map) return model.id;
+  if ((!model.reasoning || !reasoning || reasoning === "off") && typeof map.off === "string" && map.off) {
+    return map.off;
+  }
   if (model.reasoning) {
     const mapped = map[clampThinkingLevel(model, reasoning ?? "off")];
     if (typeof mapped === "string" && mapped) return mapped;
@@ -257,7 +278,7 @@ export function resolveRuntimeModel(model: Model<Api>, reasoning?: ModelThinking
   return model.id;
 }
 
-const SIBLING_ORDER: readonly ThinkingLevel[] = ["high", "medium", "xhigh", "low", "minimal"];
+const SIBLING_ORDER: readonly ModelThinkingLevel[] = ["high", "medium", "xhigh", "low", "minimal", "off"];
 
 export function siblingRuntimeModels(model: Model<Api>, currentRuntime: string): string[] {
   const map = model.thinkingLevelMap;
@@ -278,9 +299,15 @@ export function getThinkingConfig(
   reasoning?: ModelThinkingLevel,
 ): { includeThoughts: boolean; thinkingBudget: number } | undefined {
   if (!model.reasoning) return undefined;
-  const mappedLevel = (["xhigh", "high", "medium", "low", "minimal"] as const).find(
-    (l) => model.thinkingLevelMap?.[l] === runtimeModel,
-  );
+  if (model.thinkingLevelMap?.off === runtimeModel) {
+    return runtimeModel.startsWith("gemini-4") ? undefined : { includeThoughts: false, thinkingBudget: 0 };
+  }
+  const clamped = reasoning && reasoning !== "off" ? clampThinkingLevel(model, reasoning) : undefined;
+  const directMatch = clamped && model.thinkingLevelMap?.[clamped] === runtimeModel ? clamped : undefined;
+  const mappedLevel =
+    directMatch ??
+    (["xhigh", "high", "medium", "low", "minimal"] as const).find((l) => model.thinkingLevelMap?.[l] === runtimeModel);
+
   if ((!reasoning || reasoning === "off") && !mappedLevel) {
     return runtimeModel.startsWith("gemini-4") ? undefined : { includeThoughts: false, thinkingBudget: 0 };
   }
@@ -293,8 +320,9 @@ export function getThinkingConfig(
   if (runtimeModel.startsWith("claude-")) return { includeThoughts: true, thinkingBudget: 1024 };
   if (runtimeModel.startsWith("gpt-oss-")) return { includeThoughts: true, thinkingBudget: 8192 };
   if (runtimeModel.startsWith("gemini-")) {
-    const suffixLevel = runtimeModel.match(/-(xhigh|high|medium|low|minimal)$/i)?.[1]?.toLowerCase();
-    const effective = mappedLevel ?? suffixLevel ?? clampThinkingLevel(model, reasoning ?? "low");
+    const suffixLevel = runtimeModel.match(/-(extra-low|extra-high|x-high|xhigh|high|medium|low|minimal)$/i)?.[1]?.toLowerCase();
+    const normSuffix = suffixLevel ? LEVEL_MAP[suffixLevel] : undefined;
+    const effective = directMatch ?? normSuffix ?? mappedLevel ?? clamped ?? "low";
     const budget = effective === "high" || effective === "xhigh" || effective === "max" ? -1 : effective === "medium" ? 4000 : 1000;
     return { includeThoughts: true, thinkingBudget: budget };
   }
@@ -320,12 +348,12 @@ export function createCatalogManager(fetchFn?: FetchFunction) {
       const stored = context.stored as StoredAntigravityEntry | undefined;
       const hasEnums = isRecord(stored?.enums);
 
-      if (stored && Array.isArray(stored.models) && stored.models.length > 0) {
+      if (hasEnums && stored && Array.isArray(stored.models) && stored.models.length > 0) {
         const hydrated: Model<AntigravityApi>[] = stored.models
           .filter((m): m is Model<Api> => m.type === undefined || m.type === "chat")
           .map(({ compat: _, ...m }) => ({ ...m, api: ANTIGRAVITY_API, provider: PROVIDER_ID, baseUrl }));
         if (hydrated.length > 0) {
-          const nextEnums = hasEnums ? (stored.enums as Record<string, string>) : enums;
+          const nextEnums = stored.enums as Record<string, string>;
           await context.publish({
             update: () => {
               models = hydrated;
@@ -339,46 +367,42 @@ export function createCatalogManager(fetchFn?: FetchFunction) {
       const apiKey = context.credential.type === "oauth" ? credentialApiKey(context.credential) : context.credential.key;
       if (!apiKey) return;
 
-      try {
-        const creds = parseApiKey(apiKey);
-        const checkedAt = typeof stored?.checkedAt === "number" ? stored.checkedAt : 0;
-        const storedBase = (stored?.baseUrl || DEFAULT_ENDPOINT).trim().replace(/\/+$/, "");
-        const now = Date.now();
-        if (
-          !context.force &&
-          hasEnums &&
-          stored?.projectId === creds.projectId &&
-          storedBase === baseUrl &&
-          checkedAt > 0 &&
-          now >= checkedAt &&
-          now - checkedAt < REFRESH_TTL_MS
-        ) {
-          return;
-        }
-
-        const raw = await fetchAvailableModelsCatalog(creds.token, creds.projectId, {
-          signal: context.signal,
-          fetch: fetchFn,
-          baseUrl,
-        });
-        if (context.signal.aborted) return;
-        const built = buildCatalog(raw.models, raw.recommendedIds, baseUrl);
-        await context.publish({
-          persist: {
-            models: built.models,
-            checkedAt: Date.now(),
-            enums: built.enums,
-            projectId: creds.projectId,
-            baseUrl,
-          } as StoredAntigravityEntry,
-          update: () => {
-            models = built.models;
-            enums = built.enums;
-          },
-        });
-      } catch (err) {
-        if (context.force) throw err;
+      const creds = parseApiKey(apiKey);
+      const checkedAt = typeof stored?.checkedAt === "number" ? stored.checkedAt : 0;
+      const storedBase = (stored?.baseUrl || DEFAULT_ENDPOINT).trim().replace(/\/+$/, "");
+      const now = Date.now();
+      if (
+        !context.force &&
+        hasEnums &&
+        stored?.projectId === creds.projectId &&
+        storedBase === baseUrl &&
+        checkedAt > 0 &&
+        now >= checkedAt &&
+        now - checkedAt < REFRESH_TTL_MS
+      ) {
+        return;
       }
+
+      const raw = await fetchAvailableModelsCatalog(creds.token, creds.projectId, {
+        signal: context.signal,
+        fetch: fetchFn,
+        baseUrl,
+      });
+      if (context.signal.aborted) return;
+      const built = buildCatalog(raw.models, raw.recommendedIds, baseUrl);
+      await context.publish({
+        persist: {
+          models: built.models,
+          checkedAt: Date.now(),
+          enums: built.enums,
+          projectId: creds.projectId,
+          baseUrl,
+        } as StoredAntigravityEntry,
+        update: () => {
+          models = built.models;
+          enums = built.enums;
+        },
+      });
     },
   };
 }

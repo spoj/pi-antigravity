@@ -7,7 +7,7 @@ import { createStreamAntigravity } from "./stream.ts";
 
 export function createAntigravityProvider(fetchFn?: FetchFunction): Provider<AntigravityApi> {
   const catalog = createCatalogManager(fetchFn);
-  const stream = createStreamAntigravity(catalog.getModelEnum);
+  const stream = createStreamAntigravity(catalog.getModelEnum, fetchFn);
   return {
     id: PROVIDER_ID,
     name: PROVIDER_NAME,

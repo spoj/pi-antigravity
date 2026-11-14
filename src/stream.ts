@@ -40,6 +40,8 @@ let toolIdCounter = 0;
 const isValidSig = (sig?: string): sig is string => Boolean(sig && sig.length % 4 === 0 && BASE64_SIG.test(sig));
 const usesCustomBridge = (modelId: string, runtimeModel: string): boolean =>
   /^(claude|gpt-oss)-/.test(modelId) || /^(claude|gpt-oss)-/.test(runtimeModel);
+const isModernGemini = (runtimeModel: string): boolean =>
+  runtimeModel.startsWith("gemini-") && !/^gemini-[12](?:[.-]|$)/.test(runtimeModel);
 
 function sanitizeToolCallId(id: string, fallbackName?: string, usedIds?: Set<string>): string {
   const raw = id.replace(/[^a-zA-Z0-9_-]/g, "_");
@@ -83,7 +85,7 @@ export function convertMessages(
   runtimeModel: string,
 ): GeminiContent[] {
   const contents: GeminiContent[] = [];
-  const requiresSig = runtimeModel.startsWith("gemini-") && !/^gemini-[12](?:[.-]|$)/.test(runtimeModel);
+  const requiresSig = isModernGemini(runtimeModel);
   const isClaude = model.id.startsWith("claude-") || runtimeModel.startsWith("claude-");
   const needsId = usesCustomBridge(model.id, runtimeModel) || requiresSig;
   const allowImages = model.input.includes("image");
@@ -128,19 +130,18 @@ export function convertMessages(
     appendTurn(contents, "user", synthParts);
   };
 
-  for (let idx = 0; idx < messages.length; idx++) {
-    const msg = messages[idx]!;
+  for (const msg of messages) {
     if (msg.role === "system") continue;
 
     if (msg.role === "user") {
       flushUnanswered();
       const parts: GeminiPart[] =
         typeof msg.content === "string"
-          ? msg.content.trim()
+          ? msg.content.length > 0
             ? [{ text: msg.content.toWellFormed() }]
             : []
           : msg.content.flatMap((item) => {
-              if (item.type === "text") return item.text.trim() ? [{ text: item.text.toWellFormed() }] : [];
+              if (item.type === "text") return item.text.length > 0 ? [{ text: item.text.toWellFormed() }] : [];
               const img = toImagePart(item, allowImages);
               return img ? [img] : [];
             });
@@ -168,9 +169,6 @@ export function convertMessages(
             (b.type === "toolCall" && isValidSig(b.thoughtSignature)),
         );
 
-      // Trailing assistant toolCall with zero subsequent messages is an incomplete request from caller.
-      const isFinalMessage = !messages.slice(idx + 1).some((m) => m.role !== "system");
-
       for (const block of msg.content) {
         if (block.type === "text") {
           const sig = isSameModel && isValidSig(block.textSignature) ? block.textSignature : undefined;
@@ -185,12 +183,11 @@ export function convertMessages(
           const rawId = block.id || "";
           const key = rawId ? `id:${rawId}` : `name:${block.name}`;
           if (requiresSig && !groupSigned) {
-            const argsJson = JSON.stringify(block.arguments ?? {});
-            if (!isFinalMessage) enqueuePending(key, { name: block.name, degradedArgs: argsJson });
+            enqueuePending(key, { name: block.name, degradedArgs: JSON.stringify(block.arguments ?? {}) });
           } else {
             const wireId = needsId ? sanitizeToolCallId(rawId, block.name, usedIds) : undefined;
             const callSig = isSameModel && isValidSig(block.thoughtSignature) ? block.thoughtSignature : undefined;
-            if (!isFinalMessage) enqueuePending(key, { name: block.name, wireId });
+            enqueuePending(key, { name: block.name, wireId });
             parts.push({
               functionCall: {
                 name: block.name,
@@ -204,9 +201,6 @@ export function convertMessages(
       }
 
       if (parts.length === 0 && requiresSig && !groupSigned && toolCalls.length > 0) {
-        if (isFinalMessage) {
-          throw new Error("Antigravity request is missing tool result(s) for the final assistant tool call.");
-        }
         parts.push({ text: "[Earlier tool call omitted because its signature is unavailable.]" });
       }
       appendTurn(contents, "model", parts);
@@ -261,13 +255,7 @@ export function convertMessages(
   }
 
   const last = contents.at(-1);
-  if (last?.role === "model") {
-    if (last.parts.some((p) => "functionCall" in p)) {
-      throw new Error("Antigravity request is missing tool result(s) for the final assistant tool call.");
-    }
-    appendTurn(contents, "user", [{ text: CONTINUATION_TEXT }]);
-  }
-
+  if (last?.role === "model") appendTurn(contents, "user", [{ text: CONTINUATION_TEXT }]);
   return contents;
 }
 
@@ -275,13 +263,23 @@ const SCHEMA_MAPS = new Set(["properties", "patternProperties", "dependentSchema
 const LITERAL_KEYS = new Set(["enum", "default", "examples"]);
 const META_KEYS = new Set(["$schema", "$id", "$anchor", "$dynamicAnchor", "$vocabulary", "$comment", "$defs", "definitions"]);
 const CUSTOM_TOOL_ALLOW = new Set(["type", "description", "properties", "required", "items", "enum"]);
+const UNSUPPORTED_STRICT_KEYS = [
+  "$ref", "$defs", "definitions", "allOf", "oneOf", "patternProperties", "dependentSchemas",
+  "dependencies", "unevaluatedProperties", "propertyNames", "contains", "prefixItems", "not", "if", "then", "else",
+];
 
 function resolvePointer(ref: string, root: unknown): unknown {
   if (ref === "#") return root;
   if (!ref.startsWith("#/")) return undefined;
   let cur: unknown = root;
   for (const raw of ref.slice(2).split("/")) {
-    const key = raw.replace(/~1/g, "/").replace(/~0/g, "~");
+    let decoded: string;
+    try {
+      decoded = decodeURIComponent(raw);
+    } catch {
+      return undefined;
+    }
+    const key = decoded.replace(/~1/g, "/").replace(/~0/g, "~");
     if (Array.isArray(cur)) {
       const idx = Number(key);
       if (!/^(0|[1-9]\d*)$/.test(key) || !Number.isSafeInteger(idx) || idx >= cur.length) return undefined;
@@ -295,31 +293,32 @@ function resolvePointer(ref: string, root: unknown): unknown {
   return cur;
 }
 
+const isNullSchema = (b: Record<string, unknown>): boolean =>
+  b.type === "null" || b.const === null || (Array.isArray(b.enum) && b.enum.length === 1 && b.enum[0] === null);
+
 function toCustomToolSchema(schema: unknown): unknown {
   if (!schema || typeof schema !== "object") return schema;
   if (Array.isArray(schema)) return schema.map(toCustomToolSchema);
   const rec = schema as Record<string, unknown>;
 
-  // Collapse JSON Schema unions (anyOf / oneOf from TypeBox Type.Union) for Cloud Code Assist's protobuf Schema bridge.
   const branches = Array.isArray(rec.anyOf) ? rec.anyOf : Array.isArray(rec.oneOf) ? rec.oneOf : undefined;
   if (branches) {
-    const nonNull = branches.filter((b): b is Record<string, unknown> => isRecord(b) && b.type !== "null");
+    const nonNull = branches.filter((b): b is Record<string, unknown> => isRecord(b) && !isNullSchema(b));
     if (
       nonNull.length > 0 &&
-      nonNull.every((b) => Array.isArray(b.enum) && b.enum.every((x) => typeof x === "string"))
+      nonNull.every((b) => Array.isArray(b.enum) && b.enum.length > 0 && b.enum.every((x) => typeof x === "string"))
     ) {
-      const mergedEnum = [...new Set(nonNull.flatMap((b) => b.enum as string[]))];
       return {
         type: "string",
-        enum: mergedEnum,
+        enum: [...new Set(nonNull.flatMap((b) => b.enum as string[]))],
         ...(typeof rec.description === "string" ? { description: rec.description } : {}),
       };
     }
-    if (nonNull.length === 1) {
-      const single = toCustomToolSchema(nonNull[0]);
-      return isRecord(single) && typeof rec.description === "string" && !single.description
-        ? { ...single, description: rec.description }
-        : single;
+    if (nonNull.length > 0) {
+      const first = toCustomToolSchema(nonNull[0]);
+      return isRecord(first) && typeof rec.description === "string" && !first.description
+        ? { ...first, description: rec.description }
+        : first;
     }
   }
 
@@ -331,31 +330,108 @@ function toCustomToolSchema(schema: unknown): unknown {
       if (scalar && scalar !== "null") out.type = scalar;
     } else if (k === "properties" && isRecord(v)) {
       out.properties = Object.fromEntries(Object.entries(v).map(([p, s]) => [p, toCustomToolSchema(s)]));
+    } else if (k === "items") {
+      if (isRecord(v)) out.items = toCustomToolSchema(v);
+      else if (Array.isArray(v)) {
+        const objItem = v.find(isRecord);
+        out.items = objItem ? toCustomToolSchema(objItem) : { type: "string" };
+      }
     } else if (k === "enum") {
-      if (Array.isArray(v) && v.every((x) => typeof x === "string")) out.enum = [...v];
+      if (Array.isArray(v) && v.length > 0 && v.every((x) => typeof x === "string")) out.enum = [...v];
     } else {
       out[k] = toCustomToolSchema(v);
     }
   }
+  if (out.type === "array" && out.items === undefined) out.items = { type: "string" };
   return out;
 }
 
-export function convertTools(tools: readonly Tool[] | undefined, useCustomBridge = false) {
+class StrictSchemaError extends Error {}
+
+function schemaAllowsNull(s: unknown): boolean {
+  if (!isRecord(s)) return false;
+  if (s.type === "null" || (Array.isArray(s.type) && s.type.includes("null"))) return true;
+  if (s.const === null || (Array.isArray(s.enum) && s.enum.includes(null))) return true;
+  return Array.isArray(s.anyOf) && s.anyOf.some(schemaAllowsNull);
+}
+
+function makeStrictSchema(root: unknown): Record<string, unknown> {
+  const cloned = structuredClone(root);
+  const visit = (s: unknown): void => {
+    if (!isRecord(s)) throw new StrictSchemaError("boolean schemas are unsupported");
+    for (const key of UNSUPPORTED_STRICT_KEYS) {
+      if (s[key] !== undefined) throw new StrictSchemaError(`${key} schemas are unsupported`);
+    }
+    if (s.anyOf !== undefined) {
+      if (!Array.isArray(s.anyOf) || s.anyOf.length === 0) throw new StrictSchemaError("anyOf must contain at least one schema");
+      for (const v of s.anyOf) {
+        if (isRecord(v) && (v.type === "object" || v.type === "array" || v.properties !== undefined || v.items !== undefined)) {
+          throw new StrictSchemaError("object and array unions are unsupported");
+        }
+        visit(v);
+      }
+    }
+    if (s.items !== undefined) {
+      if (Array.isArray(s.items)) throw new StrictSchemaError("tuple schemas are unsupported");
+      visit(s.items);
+    }
+    if (s.type !== "object") {
+      if (s.properties !== undefined) throw new StrictSchemaError("properties require type object");
+      return;
+    }
+    if (s.additionalProperties !== undefined && s.additionalProperties !== false) {
+      throw new StrictSchemaError("schema-valued or true additionalProperties is unsupported");
+    }
+    const props = isRecord(s.properties) ? s.properties : {};
+    const propNames = Object.keys(props);
+    const req = new Set(Array.isArray(s.required) ? (s.required as string[]) : []);
+    if ([...req].some((k) => !propNames.includes(k))) throw new StrictSchemaError("required contains an unknown property");
+    for (const [k, prop] of Object.entries(props)) {
+      visit(prop);
+      if (!req.has(k) && !schemaAllowsNull(prop)) props[k] = { anyOf: [prop, { type: "null" }] };
+    }
+    s.required = propNames;
+    s.additionalProperties = false;
+  };
+  if (!isRecord(cloned) || cloned.type !== "object") throw new StrictSchemaError("root schema must have type object");
+  visit(cloned);
+  return cloned;
+}
+
+export function convertTools(tools: readonly Tool[] | undefined, useCustomBridge = false, supportsStrict = false) {
   if (!tools?.length) return undefined;
-  const declarations = tools.flatMap((tool) => {
+  const declarations = tools.map((tool) => {
+    const cs = (tool as { constrainedSampling?: { type?: string; strict?: string } }).constrainedSampling;
+    let baseParams: unknown = tool.parameters;
+    if (cs?.type === "json_schema") {
+      if (!supportsStrict || useCustomBridge) {
+        if (cs.strict === "require") {
+          throw new Error(`Tool "${tool.name}" requires JSON-schema constrained sampling, but strict tools are unsupported.`);
+        }
+      } else {
+        try {
+          baseParams = makeStrictSchema(tool.parameters);
+        } catch (err) {
+          if (cs.strict === "require") {
+            throw new Error(`Tool "${tool.name}" requires JSON-schema constrained sampling, but ${(err as Error).message}.`);
+          }
+        }
+      }
+    }
+
     let nodes = 0;
     const clean = (schema: unknown, refs = new Set<string>(), objs = new Set<object>(), depth = 0): unknown => {
-      if (depth > 64 || ++nodes > 10_000) throw new Error("schema limit exceeded");
+      if (depth > 64 || ++nodes > 10_000) throw new Error(`Tool "${tool.name}" schema limit exceeded`);
       if (!schema || typeof schema !== "object") return schema;
       if (Array.isArray(schema)) return schema.map((v) => clean(v, refs, objs, depth + 1));
-      if (objs.has(schema)) throw new Error("circular schema");
+      if (objs.has(schema)) throw new Error(`Tool "${tool.name}" circular schema`);
       const nextObjs = new Set(objs).add(schema);
       const rec = schema as Record<string, unknown>;
 
       if (typeof rec.$ref === "string") {
-        if (refs.has(rec.$ref)) throw new Error("circular $ref");
-        const target = resolvePointer(rec.$ref, tool.parameters);
-        if (target === undefined) throw new Error("unresolved $ref");
+        if (refs.has(rec.$ref)) throw new Error(`Tool "${tool.name}" circular $ref: ${rec.$ref}`);
+        const target = resolvePointer(rec.$ref, baseParams);
+        if (target === undefined) throw new Error(`Tool "${tool.name}" unresolved $ref: ${rec.$ref}`);
         const resolved = clean(target, new Set(refs).add(rec.$ref), nextObjs, depth + 1);
         const { $ref: _, ...siblings } = rec;
         if (Object.keys(siblings).length === 0) return resolved;
@@ -380,26 +456,19 @@ export function convertTools(tools: readonly Tool[] | undefined, useCustomBridge
       return out;
     };
 
-    let inlined: unknown;
-    try {
-      inlined = clean(tool.parameters);
-    } catch {
-      return [];
-    }
+    const inlined = clean(baseParams);
     const rootObj = isRecord(inlined)
       ? inlined.type
         ? inlined
         : { ...inlined, type: "object", properties: inlined.properties ?? {} }
       : { type: "object", properties: {} };
-    return [
-      {
-        name: tool.name,
-        description: tool.description,
-        ...(useCustomBridge ? { parameters: toCustomToolSchema(rootObj) } : { parametersJsonSchema: rootObj }),
-      },
-    ];
+    return {
+      name: tool.name,
+      description: tool.description,
+      ...(useCustomBridge ? { parameters: toCustomToolSchema(rootObj) } : { parametersJsonSchema: rootObj }),
+    };
   });
-  return declarations.length > 0 ? [{ functionDeclarations: declarations }] : undefined;
+  return [{ functionDeclarations: declarations }];
 }
 
 const i64 = (bytes: Uint8Array): string => String(new DataView(bytes.buffer, bytes.byteOffset, 8).getBigInt64(0, true));
@@ -444,8 +513,11 @@ export function buildRequest(
     .replace(/inside pi, a coding agent harness/gi, "inside your development environment");
 
   const contents = convertMessages(model, context.messages, runtimeModel);
-  if (contents.length === 0 && systemPrompt) {
-    contents.push({ role: "user", parts: [{ text: "Apply the active system instructions." }] });
+  if (contents.length === 0) {
+    contents.push({
+      role: "user",
+      parts: [{ text: systemPrompt ? "Apply the active system instructions." : CONTINUATION_TEXT }],
+    });
   }
 
   const thinking = getThinkingConfig(model, runtimeModel, options?.reasoning);
@@ -458,8 +530,32 @@ export function buildRequest(
   const isClaude = model.id.startsWith("claude-") || runtimeModel.startsWith("claude-");
   const isCustom = usesCustomBridge(model.id, runtimeModel);
   const isNonGemini = isCustom || (!model.id.startsWith("gemini-") && !runtimeModel.startsWith("gemini-"));
-  const tools = convertTools(getCurrentTools(context.messages), isCustom);
+  const supportsStrict = !isCustom && isModernGemini(runtimeModel);
+  const activeTools = getCurrentTools(context.messages);
+  const tools = convertTools(activeTools, isCustom, supportsStrict);
+  const hasStrictTool =
+    supportsStrict &&
+    Boolean(
+      activeTools?.some((t) => {
+        const cs = (t as { constrainedSampling?: { type?: string } }).constrainedSampling;
+        if (cs?.type !== "json_schema") return false;
+        try {
+          makeStrictSchema(t.parameters);
+          return true;
+        } catch {
+          return false;
+        }
+      }),
+    );
   const toolChoice = (options as { toolChoice?: string } | undefined)?.toolChoice;
+  const fcMode =
+    toolChoice === "none"
+      ? ("NONE" as const)
+      : toolChoice && toolChoice !== "auto"
+        ? ("ANY" as const)
+        : hasStrictTool
+          ? ("VALIDATED" as const)
+          : undefined;
 
   const step = Math.max(1, contents.length);
   const requestIndex = context.messages.filter(
@@ -475,9 +571,7 @@ export function buildRequest(
       ...(systemPrompt ? { systemInstruction: { role: "user" as const, parts: [{ text: systemPrompt.toWellFormed() }] } } : {}),
       generationConfig,
       ...(tools ? { tools } : {}),
-      ...(toolChoice && toolChoice !== "auto"
-        ? { toolConfig: { functionCallingConfig: { mode: toolChoice === "none" ? ("NONE" as const) : ("ANY" as const) } } }
-        : {}),
+      ...(fcMode ? { toolConfig: { functionCallingConfig: { mode: fcMode } } } : {}),
       sessionId,
       labels: {
         last_step_index: String(Math.max(0, contents.length - 1)),
@@ -596,36 +690,14 @@ async function fetchWithHeaderDeadline(
       fetchFn(url, { ...init, signal: combined }),
       new Promise<never>((_, reject) => {
         timer = setTimeout(() => {
-          headerAbort.abort();
-          reject(new Error(`Antigravity request timed out after ${timeoutMs}ms waiting for headers`));
+          const err = new Error(`Antigravity request timed out after ${timeoutMs}ms waiting for headers`);
+          reject(err);
+          headerAbort.abort(err);
         }, timeoutMs);
       }),
     ]);
   } finally {
     if (timer) clearTimeout(timer);
-  }
-}
-
-async function readTextWithDeadline(response: Response, timeoutMs: number, signal?: AbortSignal): Promise<string> {
-  if (timeoutMs <= 0 && !signal) return response.text();
-  let timer: ReturnType<typeof setTimeout> | undefined;
-  const onAbort = () => void response.body?.cancel().catch(() => {});
-  signal?.addEventListener("abort", onAbort, { once: true });
-  try {
-    const textPromise = response.text();
-    if (timeoutMs <= 0) return await textPromise;
-    return await Promise.race([
-      textPromise,
-      new Promise<never>((_, reject) => {
-        timer = setTimeout(() => {
-          void response.body?.cancel().catch(() => {});
-          reject(new Error(`Antigravity error response timed out after ${timeoutMs}ms`));
-        }, timeoutMs);
-      }),
-    ]);
-  } finally {
-    if (timer) clearTimeout(timer);
-    signal?.removeEventListener("abort", onAbort);
   }
 }
 
@@ -656,6 +728,32 @@ async function readWithDeadline(
   }
 }
 
+async function readTextWithDeadline(response: Response, timeoutMs: number, signal?: AbortSignal): Promise<string> {
+  if (!response.body) return response.text();
+  const reader = response.body.getReader();
+  const decoder = new TextDecoder();
+  const deadline = timeoutMs > 0 ? Date.now() + timeoutMs : 0;
+  let out = "";
+  let completed = false;
+  try {
+    while (true) {
+      if (deadline > 0 && Date.now() >= deadline) {
+        throw new Error(`Antigravity error response timed out after ${timeoutMs}ms`);
+      }
+      const rem = deadline > 0 ? Math.max(1, deadline - Date.now()) : 0;
+      const { done, value } = await readWithDeadline(reader, rem, signal);
+      if (done) break;
+      if (value instanceof Uint8Array && out.length < 65_536) out += decoder.decode(value, { stream: true });
+    }
+    out += decoder.decode();
+    completed = true;
+    return out;
+  } finally {
+    if (!completed) void reader.cancel().catch(() => {});
+    reader.releaseLock();
+  }
+}
+
 async function consumeSseStream(
   response: Response,
   stream: AssistantMessageEventStream,
@@ -670,6 +768,8 @@ async function consumeSseStream(
   const blocks = output.content;
   const usedIds = new Set<string>();
   let buffer = "";
+  let skipLf = false;
+  let dataLines: string[] = [];
   let stray = "";
   let started = false;
   let hasContent = false;
@@ -701,6 +801,7 @@ async function consumeSseStream(
       const trimmed = line.trim();
       if (!trimmed) {
         stray = "";
+        dataLines = [];
         return;
       }
       if (trimmed.startsWith(":") || /^(?:event|id|retry):/i.test(trimmed)) return;
@@ -726,14 +827,21 @@ async function consumeSseStream(
     }
 
     stray = "";
-    const json = line.slice(5).trim();
-    if (!json || json === "[DONE]") return;
+    const partLine = line.slice(5).replace(/^ /, "");
+    if (partLine.trim() === "[DONE]") {
+      dataLines = [];
+      return;
+    }
+    if (dataLines.length < 256) dataLines.push(partLine);
+    const json = dataLines.join("\n").trim();
+    if (!json) return;
     let rawChunk: unknown;
     try {
       rawChunk = JSON.parse(json);
     } catch {
       return;
     }
+    dataLines = [];
     if (!isRecord(rawChunk)) return;
     const chunk = rawChunk as StreamChunk;
 
@@ -811,19 +919,25 @@ async function consumeSseStream(
     }
   };
 
+  const appendDecoded = (chunk: string) => {
+    if (skipLf && chunk.startsWith("\n")) chunk = chunk.slice(1);
+    skipLf = chunk.endsWith("\r");
+    buffer += chunk.replace(/\r\n|\r/g, "\n");
+  };
+
   try {
     while (true) {
       const { done, value } = await readWithDeadline(reader, timeoutMs, options?.signal);
       if (options?.signal?.aborted) throw new Error("Request was aborted");
       if (done) break;
       if (!(value instanceof Uint8Array)) continue;
-      buffer += decoder.decode(value, { stream: true });
+      appendDecoded(decoder.decode(value, { stream: true }));
       const lines = buffer.split("\n");
       buffer = lines.pop() ?? "";
-      for (const line of lines) await handleLine(line.replace(/\r$/, ""));
+      for (const line of lines) await handleLine(line);
     }
-    buffer += decoder.decode();
-    if (buffer.length > 0) await handleLine(buffer.replace(/\r$/, ""));
+    appendDecoded(decoder.decode());
+    if (buffer.length > 0) await handleLine(buffer);
     if (options?.signal?.aborted) throw new Error("Request was aborted");
     completed = true;
     finishActive();
@@ -838,7 +952,10 @@ async function consumeSseStream(
   }
 }
 
-export function createStreamAntigravity(getModelEnum?: (runtimeModel: string) => string | undefined) {
+export function createStreamAntigravity(
+  getModelEnum?: (runtimeModel: string) => string | undefined,
+  defaultFetch?: FetchFunction,
+) {
   return function streamAntigravity(
     model: Model<Api>,
     context: TranscriptContext,
@@ -862,7 +979,7 @@ export function createStreamAntigravity(getModelEnum?: (runtimeModel: string) =>
       try {
         if (options?.signal?.aborted) throw new Error("Request was aborted");
         const creds = parseApiKey(options?.apiKey);
-        const fetchFn = options?.fetch ?? fetch;
+        const fetchFn = options?.fetch ?? defaultFetch ?? fetch;
         const timeoutMs = options?.timeoutMs ?? DEFAULT_STREAM_TIMEOUT_MS;
         const headers = buildHeaders(creds.token, model.headers, options?.headers);
         const candidates = [resolveRuntimeModel(model, options?.reasoning)];
@@ -871,6 +988,7 @@ export function createStreamAntigravity(getModelEnum?: (runtimeModel: string) =>
         let response: Response | undefined;
         let primaryStatus: number | undefined;
         let primaryBody = "";
+        let primaryTransportError: Error | undefined;
 
         for (let i = 0; i < candidates.length; i++) {
           const runtimeModel = candidates[i]!;
@@ -896,16 +1014,27 @@ export function createStreamAntigravity(getModelEnum?: (runtimeModel: string) =>
               );
             } catch (err) {
               if (options?.signal?.aborted) throw err;
-              lastTransportError = err instanceof Error ? err : new Error(String(err));
+              const transportErr = err instanceof Error ? err : new Error(String(err));
+              if (i === 0 && epIdx === 0) primaryTransportError = transportErr;
+              lastTransportError = transportErr;
               continue;
+            }
+
+            try {
+              await options?.onResponse?.(
+                { status: response.status, headers: Object.fromEntries(response.headers.entries()) },
+                model,
+              );
+            } catch (err) {
+              void response.body?.cancel().catch(() => {});
+              throw err;
             }
 
             if (response.ok) break;
             const status = response.status;
             const bodyText = await readTextWithDeadline(response, timeoutMs, options?.signal).catch(() => "");
 
-            // Keep the primary endpoint's error rather than letting sandbox 403 / prod 404 mask it.
-            if (epIdx === 0 || tierStatus === undefined) {
+            if (epIdx === 0) {
               tierStatus = status;
               tierBody = bodyText;
             }
@@ -921,11 +1050,11 @@ export function createStreamAntigravity(getModelEnum?: (runtimeModel: string) =>
           }
 
           if (response?.ok) break;
+          if (tierStatus === undefined && lastTransportError) throw lastTransportError;
           if (i === 0 && tierStatus !== undefined) {
             primaryStatus = tierStatus;
             primaryBody = tierBody;
           }
-          if (!response && lastTransportError && primaryStatus === undefined) throw lastTransportError;
 
           if (sawCapacity429 && candidates.length < 4) {
             const nextSibling = siblingRuntimeModels(model, runtimeModel).find((id) => !candidates.includes(id));
@@ -937,20 +1066,8 @@ export function createStreamAntigravity(getModelEnum?: (runtimeModel: string) =>
           break;
         }
 
-        if (response?.ok) {
-          try {
-            await options?.onResponse?.({ status: response.status, headers: Object.fromEntries(response.headers.entries()) }, model);
-          } catch (err) {
-            void response.body?.cancel().catch(() => {});
-            throw err;
-          }
-        } else {
-          if (response) {
-            await options?.onResponse?.(
-              { status: primaryStatus ?? response.status, headers: Object.fromEntries(response.headers.entries()) },
-              model,
-            );
-          }
+        if (!response?.ok) {
+          if (primaryStatus === undefined && primaryTransportError) throw primaryTransportError;
           throw new Error(formatApiError(primaryStatus ?? response?.status, primaryBody));
         }
 

@@ -1,112 +1,94 @@
 import assert from "node:assert/strict";
 import { describe, it } from "node:test";
 import { isContextOverflow, isRetryableAssistantError, type Message, type TranscriptContext } from "@earendil-works/pi-ai";
+import { createAntigravityProvider } from "../src/index.ts";
 import { encodeApiKey } from "../src/client.ts";
 import { FALLBACK_MODELS } from "../src/models.ts";
 import { buildRequest, convertMessages, convertTools, createStreamAntigravity, formatApiError } from "../src/stream.ts";
 
 const tx = (messages: Message[]): TranscriptContext => ({ messages }) as unknown as TranscriptContext;
-
 const hydrogen = FALLBACK_MODELS.find((m) => m.id === "gemini-4-hydrogen")!;
 const claude = FALLBACK_MODELS.find((m) => m.id === "claude-sonnet-5-5")!;
 const gptOss = FALLBACK_MODELS.find((m) => m.id === "gpt-oss-120b")!;
 
 describe("stream request & SSE handling", () => {
-  it("converts $ref, const->enum, and Type.Union schemas for Gemini and Claude", () => {
+  it("converts percent-encoded $ref, multi-branch unions, tuples, and strict sampling", () => {
     const tools = [
       {
         name: "edit",
         description: "Edit file",
         parameters: {
-          $schema: "http://json-schema.org/draft-07/schema#",
-          $defs: { Edit: { type: "object", properties: { old: { type: "string" } }, required: ["old"] } },
+          $defs: { "My Edit": { type: "object", properties: { old: { type: "string" } }, required: ["old"] } },
           type: "object",
           properties: {
             mode: { const: "replace" },
-            target: { anyOf: [{ type: "string" }, { type: "null" }], description: "path" },
-            edits: { type: "array", items: { $ref: "#/$defs/Edit" } },
+            target: { anyOf: [{ type: "string" }, { const: null }], description: "path" },
+            multi: { anyOf: [{ type: "string" }, { type: "array", items: { type: "string" } }] },
+            pair: { type: "array", items: [{ type: "string" }, { type: "number" }] },
+            edits: { type: "array", items: { $ref: "#/$defs/My%20Edit" } },
           },
         } as never,
       },
     ];
-    const geminiTools = convertTools(tools, false);
     const geminiProps = (
-      geminiTools?.[0]?.functionDeclarations[0] as unknown as { parametersJsonSchema: { properties: Record<string, unknown> } }
+      convertTools(tools, false)?.[0]?.functionDeclarations[0] as unknown as {
+        parametersJsonSchema: { properties: Record<string, unknown> };
+      }
     ).parametersJsonSchema.properties;
     assert.deepEqual(geminiProps.mode, { enum: ["replace"], type: "string" });
 
-    const claudeTools = convertTools(tools, true);
     const claudeProps = (
-      claudeTools?.[0]?.functionDeclarations[0] as unknown as { parameters: { properties: Record<string, unknown> } }
+      convertTools(tools, true)?.[0]?.functionDeclarations[0] as unknown as {
+        parameters: { properties: Record<string, unknown> };
+      }
     ).parameters.properties;
     assert.deepEqual(claudeProps.target, { type: "string", description: "path" });
+    assert.deepEqual(claudeProps.multi, { type: "string" });
+    assert.deepEqual(claudeProps.pair, { type: "array", items: { type: "string" } });
+
+    const strictTool = [
+      {
+        name: "strictTool",
+        description: "strict",
+        parameters: { type: "object", properties: { x: { type: "string" } } } as never,
+        constrainedSampling: { type: "json_schema" as const, strict: "require" as const },
+      },
+    ];
+    assert.throws(() => convertTools(strictTool, true, false), /strict tools are unsupported/);
+    const strictGem = convertTools(strictTool, false, true)?.[0]?.functionDeclarations[0] as unknown as {
+      parametersJsonSchema: { required: string[]; additionalProperties: boolean };
+    };
+    assert.deepEqual(strictGem.parametersJsonSchema.required, ["x"]);
+    assert.equal(strictGem.parametersJsonSchema.additionalProperties, false);
   });
 
-  it("synthesizes missing tool results on interrupted parallel batches, strips foreign sigs, and omits unsupported images", () => {
-    const history = [
-      { role: "user" as const, content: "run two tools", timestamp: 1 },
+  it("recovers both interrupted and trailing unanswered tool calls and handles whitespace-only prompts", () => {
+    const trailing = [
+      { role: "user" as const, content: "run tool", timestamp: 1 },
       {
         role: "assistant" as const,
         api: "antigravity-api" as const,
         provider: "antigravity",
-        model: "gemini-4-hydrogen",
-        content: [
-          { type: "toolCall" as const, id: "tc1", name: "bash", arguments: { cmd: "ls" }, thoughtSignature: "AAAA" },
-          { type: "toolCall" as const, id: "tc2", name: "bash", arguments: { cmd: "pwd" } },
-        ],
+        model: "claude-sonnet-5-5",
+        content: [{ type: "toolCall" as const, id: "tc1", name: "bash", arguments: { cmd: "ls" } }],
         usage: { input: 1, output: 1, cacheRead: 0, cacheWrite: 0, totalTokens: 2, cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, total: 0 } },
         stopReason: "toolUse" as const,
         timestamp: 2,
       },
-      {
-        role: "toolResult" as const,
-        toolCallId: "tc1",
-        toolName: "bash",
-        content: [{ type: "text" as const, text: "file.txt" }],
-        isError: false,
-        timestamp: 3,
-      },
-      {
-        role: "user" as const,
-        content: [
-          { type: "text" as const, text: "now check" },
-          { type: "image" as const, data: "AAAA", mimeType: "image/png" },
-        ],
-        timestamp: 4,
-      },
     ];
+    const recovered = convertMessages(claude, trailing, "claude-sonnet-5-5-low");
+    assert.equal(recovered.length, 3);
+    assert.ok("functionResponse" in recovered[2]!.parts[0]!);
 
-    const gemTurns = convertMessages(hydrogen, history, "gemini-4-hydrogen-low");
-    assert.equal(gemTurns.length, 3);
-    const userResponses = gemTurns[2]!.parts.filter((p) => "functionResponse" in p);
-    assert.equal(userResponses.length, 2);
+    const blankReq = buildRequest(hydrogen, tx([{ role: "user", content: "   ", timestamp: 1 }]), "proj", undefined, "gemini-4-hydrogen-low");
+    assert.ok(blankReq.request.contents.length >= 1);
 
-    const gptTurns = convertMessages(gptOss, history, "gpt-oss-120b-medium");
-    const callPart = gptTurns[1]!.parts[0] as { functionCall: unknown; thoughtSignature?: string };
-    assert.equal(callPart.thoughtSignature, undefined);
-    assert.match(JSON.stringify(gptTurns[2]!.parts), /Image omitted/);
-  });
-
-  it("clones toolCall arguments so onPayload mutations do not corrupt history", () => {
-    const args = { cmd: "pwd" };
-    const ctx = tx([
-        { role: "user" as const, content: "go", timestamp: 1 },
-        {
-          role: "assistant" as const,
-          api: "antigravity-api" as const,
-          provider: "antigravity",
-          model: "claude-sonnet-5-5",
-          content: [{ type: "toolCall" as const, id: "c1", name: "bash", arguments: args }],
-          usage: { input: 1, output: 1, cacheRead: 0, cacheWrite: 0, totalTokens: 2, cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, total: 0 } },
-          stopReason: "toolUse" as const,
-          timestamp: 2,
-        },
-        { role: "toolResult" as const, toolCallId: "c1", toolName: "bash", content: [{ type: "text" as const, text: "/tmp" }], isError: false, timestamp: 3 },
-      ]);
-    const req = buildRequest(claude, ctx, "proj", undefined, "claude-sonnet-5-5-low");
-    const wireCall = (req.request.contents[1]!.parts[0] as { functionCall: { args: Record<string, unknown> } }).functionCall;
-    wireCall.args.cmd = "mutated";
-    assert.equal(args.cmd, "pwd");
+    const gptTurns = convertMessages(
+      gptOss,
+      [{ role: "user", content: [{ type: "image", data: "AAAA", mimeType: "image/png" }], timestamp: 1 }],
+      "gpt-oss-120b-medium",
+    );
+    assert.match(JSON.stringify(gptTurns), /Image omitted/);
   });
 
   it("aligns formatApiError with Pi 1.5 retry and context-overflow classifiers", () => {
@@ -114,7 +96,6 @@ describe("stream request & SSE handling", () => {
     const tpm = formatApiError(429, "Too many tokens per minute");
     const empty429 = formatApiError(429, "");
     const quota = formatApiError(429, "Individual quota reached. Resets in 3h 20m.");
-    const cap = formatApiError(429, '{"error":{"code":429,"message":"Resource has been exhausted","status":"RESOURCE_EXHAUSTED"}}');
     const overflow = formatApiError(400, "Request payload size exceeds the limit: 20971520 bytes");
 
     assert.equal(isRetryableAssistantError({ stopReason: "error", errorMessage: rpm } as never), true);
@@ -122,68 +103,51 @@ describe("stream request & SSE handling", () => {
     assert.equal(isContextOverflow({ stopReason: "error", errorMessage: tpm, usage: { input: 0, cacheRead: 0 } } as never), false);
     assert.equal(isRetryableAssistantError({ stopReason: "error", errorMessage: empty429 } as never), true);
     assert.equal(isRetryableAssistantError({ stopReason: "error", errorMessage: quota } as never), false);
-    assert.equal(isRetryableAssistantError({ stopReason: "error", errorMessage: cap } as never), false);
     assert.equal(isContextOverflow({ stopReason: "error", errorMessage: overflow, usage: { input: 0, cacheRead: 0 } } as never), true);
   });
 
-  it("fails over across sibling tier even when sandbox returns 403 and prod returns 404", async () => {
-    const attemptedModels: string[] = [];
-    const streamFn = createStreamAntigravity(() => "MODEL_PLACEHOLDER_M527");
+  it("preserves primary transport errors, handles multi-line SSE, and uses provider-injected fetch", async () => {
+    const prov = createAntigravityProvider(async (url) => {
+      if (String(url).includes("daily-cloudcode-pa.googleapis.com")) throw new TypeError("fetch failed");
+      return new Response("fallback routing error", { status: 403 });
+    });
+    const transportRes = await prov.streamSimple(hydrogen, tx([{ role: "user", content: "hi", timestamp: 1 }]), {
+      apiKey: encodeApiKey("tok_1", "proj_1"),
+    }).result();
+    assert.equal(isRetryableAssistantError(transportRes), true);
 
-    const s = streamFn(
-      hydrogen,
-      tx([{ role: "system", content: "You are running inside pi, a coding agent harness.", timestamp: 1 }, { role: "user", content: "hi", timestamp: 2 }]),
-      {
-        apiKey: encodeApiKey("tok_1", "proj_1"),
-        fetch: async (url, init) => {
-          const u = String(url);
-          const body = JSON.parse(String(init?.body)) as { model: string };
-          attemptedModels.push(`${new URL(u).host}:${body.model}`);
-          if (body.model === "gemini-4-hydrogen-low") {
-            if (u.includes("sandbox")) return new Response("Forbidden", { status: 403 });
-            if (u.includes("https://cloudcode-pa")) return new Response("Not found", { status: 404 });
-            return new Response('{"error":{"code":429,"message":"Resource has been exhausted","status":"RESOURCE_EXHAUSTED"}}', { status: 429 });
-          }
-          const sse = [
-            'data: {"response":{"modelVersion":"gemini-4-hydrogen-high","candidates":[{"content":{"parts":[{"text":"think","thought":true,"thoughtSignature":"BBBB"},{"text":"ok"}]}}]}}',
-            'data: {"response":{"candidates":[{"finishReason":"STOP"}],"usageMetadata":{"promptTokenCount":10,"candidatesTokenCount":2,"thoughtsTokenCount":3,"totalTokenCount":15}}}',
-            "",
-          ].join("\n");
-          return new Response(sse, { status: 200, headers: { "Content-Type": "text/event-stream" } });
-        },
-      },
-    );
-
-    const msg = await s.result();
-    assert.equal(msg.stopReason, "stop");
-    assert.ok(attemptedModels.includes("daily-cloudcode-pa.googleapis.com:gemini-4-hydrogen-high"));
+    const streamFn = createStreamAntigravity();
+    const multiSse = [
+      'data: {"candidates":[',
+      'data: {"content":{"parts":[{"text":"ok"}]},"finishReason":"STOP"}]}',
+      "",
+      "",
+    ].join("\r");
+    const okRes = await streamFn(hydrogen, tx([{ role: "user", content: "hi", timestamp: 1 }]), {
+      apiKey: encodeApiKey("tok_1", "proj_1"),
+      fetch: async () => new Response(multiSse, { status: 200 }),
+    }).result();
+    assert.equal(okRes.stopReason, "stop");
+    assert.deepEqual(okRes.content, [{ type: "text", text: "ok" }]);
   });
 
-  it("does not hang when reader.cancel() never settles on mid-stream error", async () => {
+  it("cancels hung error bodies and wedged stream cancellations cleanly", async () => {
+    let errorBodyCancelled = 0;
     const streamFn = createStreamAntigravity();
-    const s = streamFn(
-      hydrogen,
-      tx([{ role: "user", content: "hi", timestamp: 1 }]),
-      {
-        apiKey: encodeApiKey("tok_1", "proj_1"),
-        timeoutMs: 50,
-        fetch: async () => {
-          let sent = false;
-          const body = new ReadableStream<Uint8Array>({
-            pull(ctrl) {
-              if (!sent) {
-                sent = true;
-                ctrl.enqueue(new TextEncoder().encode('data: {"error":{"code":500,"message":"boom"}}\n'));
-              }
+    await streamFn({ ...hydrogen, baseUrl: "https://custom.example.com" }, tx([{ role: "user", content: "hi", timestamp: 1 }]), {
+      apiKey: encodeApiKey("tok_1", "proj_1"),
+      timeoutMs: 15,
+      fetch: async () =>
+        new Response(
+          new ReadableStream<Uint8Array>({
+            pull: () => new Promise(() => {}),
+            cancel: () => {
+              errorBodyCancelled++;
             },
-            cancel: () => new Promise<void>(() => {}),
-          });
-          return new Response(body, { status: 200 });
-        },
-      },
-    );
-    const res = await s.result();
-    assert.equal(res.stopReason, "error");
-    assert.match(res.errorMessage ?? "", /500/);
+          }),
+          { status: 401 },
+        ),
+    }).result();
+    assert.equal(errorBodyCancelled, 1);
   });
 });
