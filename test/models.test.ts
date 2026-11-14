@@ -48,10 +48,7 @@ test("buildCatalog groups variants, filters internal/disabled/image entries, and
   assert.deepEqual(siblingRuntimeModels(m, "gemini-4-hydrogen-low"), ["gemini-4-hydrogen-xhigh"]);
 });
 
-test("resolveRuntimeModel supports pre-0.14 thinkingLevelMap and getThinkingConfig clamps/guards", () => {
-  const legacy = { ...opus, thinkingLevelMap: { off: null, minimal: null, low: "low", medium: "medium", high: "high", xhigh: null, max: null } };
-  assert.equal(resolveRuntimeModel(legacy, "high"), "claude-opus-5-5-high");
-
+test("getThinkingConfig clamps levels and guards non-reasoning models", () => {
   assert.equal(getThinkingConfig({ ...hydrogen, reasoning: false }, "gemini-4-hydrogen-low", "high"), undefined);
   assert.equal(getThinkingConfig(hydrogen, "gemini-4-hydrogen-low", undefined), undefined);
   assert.equal(getThinkingConfig(hydrogen, "gemini-4-hydrogen-low", "off"), undefined);

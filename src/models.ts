@@ -234,15 +234,10 @@ export function buildCatalog(
   return { models, enums };
 }
 
-// Compatibility with pre-0.14 models-store.json entries that stored "high" instead of "<id>-high".
-const expandRuntime = (modelId: string, level: string, mapped: string): string =>
-  mapped === level && !modelId.endsWith(`-${level}`) ? `${modelId}-${level}` : mapped;
-
 export function resolveRuntimeModel(model: Model<Api>, reasoning?: ModelThinkingLevel): string {
   if (!model.reasoning || !model.thinkingLevelMap) return model.id;
-  const effective = clampThinkingLevel(model, reasoning ?? "off");
-  const mapped = model.thinkingLevelMap[effective];
-  return typeof mapped === "string" && mapped ? expandRuntime(model.id, effective, mapped) : model.id;
+  const mapped = model.thinkingLevelMap[clampThinkingLevel(model, reasoning ?? "off")];
+  return typeof mapped === "string" && mapped ? mapped : model.id;
 }
 
 const SIBLING_ORDER: readonly ThinkingLevel[] = ["high", "medium", "xhigh", "low", "minimal"];
@@ -252,10 +247,10 @@ export function siblingRuntimeModels(model: Model<Api>, currentRuntime: string):
   if (!map) return [];
   const out: string[] = [];
   for (const level of SIBLING_ORDER) {
-    const raw = map[level];
-    if (typeof raw !== "string" || !raw) continue;
-    const runtime = expandRuntime(model.id, level, raw);
-    if (runtime !== currentRuntime && !out.includes(runtime)) out.push(runtime);
+    const runtime = map[level];
+    if (typeof runtime === "string" && runtime && runtime !== currentRuntime && !out.includes(runtime)) {
+      out.push(runtime);
+    }
   }
   return out;
 }
