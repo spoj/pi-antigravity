@@ -945,7 +945,12 @@ export function buildRequest(
   const injectedSkills = context.messages.flatMap((msg) =>
     msg.role === "user" ? skillBlocks(msg.content) : [],
   );
-  const systemPromptText = resolveCurrentSystemPrompt(context);
+  const systemPromptText = resolveCurrentSystemPrompt(context)
+    ?.replace(
+      /running inside pi(?:, a coding agent harness)?/gi,
+      "running inside your development environment",
+    )
+    .replace(/inside pi, a coding agent harness/gi, "inside your development environment");
   const declaredTools = resolveCurrentTools(context);
   const systemParts = systemPromptText
     ? [{ text: sanitizeText(systemPromptText) }]

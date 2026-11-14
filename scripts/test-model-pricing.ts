@@ -69,6 +69,18 @@ assert.deepEqual(getAntigravityModelCost("gemini-2.5-flash-lite"), {
   cacheRead: 0.01,
   cacheWrite: 0.1,
 });
+assert.deepEqual(getAntigravityModelCost("gemini-4-argon"), {
+  input: 2.0,
+  output: 10.0,
+  cacheRead: 0.1,
+  cacheWrite: 2.0,
+});
+assert.deepEqual(getAntigravityModelCost("gemini-4-carbon"), {
+  input: 2.0,
+  output: 10.0,
+  cacheRead: 0.1,
+  cacheWrite: 2.0,
+});
 assert.deepEqual(getAntigravityModelCost("gemini-4-hydrogen"), {
   input: 1.5,
   output: 7.5,

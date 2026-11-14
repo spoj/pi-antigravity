@@ -189,6 +189,7 @@ export function getMaxOutputTokens(modelId: string, runtimeModel?: string): numb
  * there is no cache-write rate to publish; the input rate is used.
  */
 const gemini38FlashCost = { input: 0.75, output: 3.75, cacheRead: 0.075, cacheWrite: 0.75 };
+const gemini4ProCost = { input: 2.0, output: 10.0, cacheRead: 0.1, cacheWrite: 2.0 };
 const gemini4HydrogenCost = { input: 1.5, output: 7.5, cacheRead: 0.075, cacheWrite: 1.5 };
 const gemini37FlashCost = { input: 0.75, output: 3.75, cacheRead: 0.075, cacheWrite: 0.75 };
 const gemini36FlashCost = { input: 0.75, output: 3.75, cacheRead: 0.075, cacheWrite: 0.75 };
@@ -211,6 +212,8 @@ export const ANTIGRAVITY_DISCOVERED_MODEL_COSTS: Record<
   string,
   { input: number; output: number; cacheRead: number; cacheWrite: number }
 > = {
+  "gemini-4-argon": gemini4ProCost,
+  "gemini-4-carbon": gemini4ProCost,
   "gemini-4-hydrogen": gemini4HydrogenCost,
   "gemini-3.5-flash": gemini35FlashCost,
   "gemini-3.5-flash-lite": gemini35FlashLiteCost,

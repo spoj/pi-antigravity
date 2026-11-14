@@ -1512,6 +1512,26 @@ const withPiPrompt = buildRequest(
 assert.equal(withPiPrompt.request.systemInstruction.parts.length, 1);
 assert.equal(withPiPrompt.request.systemInstruction.parts[0]?.text, "You are Pi. Follow AGENTS.md.");
 
+for (const [prompt, expected] of [
+  [
+    "You are a coding assistant running inside pi, a coding agent harness. Help users inspect files, run commands, and modify code.",
+    "You are a coding assistant running inside your development environment. Help users inspect files, run commands, and modify code.",
+  ],
+  [
+    "You are a coding assistant running inside pi.",
+    "You are a coding assistant running inside your development environment.",
+  ],
+] as const) {
+  const sanitized = buildRequest(
+    flash37Model,
+    { ...dummyContext, systemPrompt: prompt },
+    "test-proj",
+    {},
+    "gemini-3.7-flash-low",
+  );
+  assert.equal(sanitized.request.systemInstruction.parts[0]?.text, expected);
+}
+
 // Skill-only turns are injected instructions, not user prompts. The request remains
 // valid without inventing a user message, and the Skill is preserved as system context.
 const skillOnlyContext = {
