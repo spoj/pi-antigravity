@@ -134,15 +134,16 @@ export async function loadCodeAssist(
   options?: { signal?: AbortSignal; fetch?: FetchFunction; baseUrl?: string; timeoutMs?: number },
 ): Promise<string | undefined> {
   const fetchFn = options?.fetch ?? fetch;
-  const timeoutMs = options?.timeoutMs ?? DISCOVERY_TIMEOUT_MS;
+  const deadline = withTimeout(options?.signal, options?.timeoutMs ?? DISCOVERY_TIMEOUT_MS);
   for (const endpoint of endpointsFor(options?.baseUrl)) {
     if (options?.signal?.aborted) throw new Error("Request was aborted");
+    if (deadline?.aborted) break;
     try {
       const res = await fetchFn(`${endpoint}/v1internal:loadCodeAssist`, {
         method: "POST",
         headers: buildHeaders(token),
         body: JSON.stringify({ metadata: { ideType: "ANTIGRAVITY" } }),
-        signal: withTimeout(options?.signal, timeoutMs),
+        signal: deadline,
       });
       if (!res.ok) {
         void res.body?.cancel().catch(() => {});
@@ -155,7 +156,7 @@ export async function loadCodeAssist(
         method: "POST",
         headers: buildHeaders(token),
         body: "{}",
-        signal: withTimeout(options?.signal, timeoutMs),
+        signal: deadline,
       });
       if (listRes.ok) {
         const listed = extractProjectId(await listRes.json());
@@ -165,6 +166,7 @@ export async function loadCodeAssist(
       }
     } catch (err) {
       if (options?.signal?.aborted) throw err;
+      if (deadline?.aborted) break;
     }
   }
   return undefined;

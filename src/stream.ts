@@ -241,6 +241,9 @@ export function convertMessages(
 
   flushUnanswered();
 
+  if (contents[0]?.role === "model") {
+    contents.unshift({ role: "user", parts: [{ text: CONTINUATION_TEXT }] });
+  }
   for (let i = 0; i < contents.length; i++) {
     if (contents[i]!.role === "model" && contents[i]!.parts.some((p) => "functionCall" in p) && contents[i - 1]?.role !== "user") {
       contents.splice(i, 0, { role: "user", parts: [{ text: CONTINUATION_TEXT }] });
@@ -343,6 +346,14 @@ function toCustomToolSchema(schema: unknown): unknown {
     }
   }
   if (out.type === "array" && out.items === undefined) out.items = { type: "string" };
+  if (out.properties && Array.isArray(out.required)) {
+    const valid = (out.required as unknown[]).filter(
+      (r): r is string => typeof r === "string" && Object.hasOwn(out.properties as object, r),
+    );
+    if (valid.length > 0) out.required = valid;
+    else delete out.required;
+  }
+  if (!out.type) out.type = out.properties ? "object" : "string";
   return out;
 }
 
@@ -443,8 +454,14 @@ export function convertTools(tools: readonly Tool[] | undefined, useCustomBridge
       for (const [k, v] of Object.entries(rec)) {
         if (META_KEYS.has(k)) continue;
         if (k === "const") {
-          out.enum = [structuredClone(v)];
-          if (typeof v === "string" && rec.type === undefined) out.type = "string";
+          if (v === null) {
+            out.type = "null";
+          } else {
+            out.enum = [structuredClone(v)];
+            if ((typeof v === "string" || typeof v === "number" || typeof v === "boolean") && rec.type === undefined) {
+              out.type = typeof v;
+            }
+          }
         } else if (SCHEMA_MAPS.has(k) && isRecord(v)) {
           out[k] = Object.fromEntries(Object.entries(v).map(([p, s]) => [p, clean(s, refs, nextObjs, depth + 1)]));
         } else if (LITERAL_KEYS.has(k)) {
@@ -520,14 +537,17 @@ export function buildRequest(
     });
   }
 
-  const thinking = getThinkingConfig(model, runtimeModel, options?.reasoning);
-  const generationConfig = {
-    ...(options?.temperature !== undefined ? { temperature: options.temperature } : {}),
-    ...(thinking ? { thinkingConfig: thinking } : {}),
-    maxOutputTokens: options?.maxTokens !== undefined ? Math.min(options.maxTokens, model.maxTokens) : model.maxTokens,
-  };
-
   const isClaude = model.id.startsWith("claude-") || runtimeModel.startsWith("claude-");
+  const thinking = getThinkingConfig(model, runtimeModel, options?.reasoning);
+  const rawMax = options?.maxTokens !== undefined ? Math.min(options.maxTokens, model.maxTokens) : model.maxTokens;
+  const maxOutputTokens =
+    isClaude && thinking?.includeThoughts ? Math.max(rawMax, thinking.thinkingBudget + 256) : rawMax;
+  const allowTemp = options?.temperature !== undefined && (!isClaude || !thinking?.includeThoughts || options.temperature === 1);
+  const generationConfig = {
+    ...(allowTemp ? { temperature: options!.temperature } : {}),
+    ...(thinking ? { thinkingConfig: thinking } : {}),
+    maxOutputTokens,
+  };
   const isCustom = usesCustomBridge(model.id, runtimeModel);
   const isNonGemini = isCustom || (!model.id.startsWith("gemini-") && !runtimeModel.startsWith("gemini-"));
   const supportsStrict = !isCustom && isModernGemini(runtimeModel);
@@ -570,8 +590,7 @@ export function buildRequest(
       contents,
       ...(systemPrompt ? { systemInstruction: { role: "user" as const, parts: [{ text: systemPrompt.toWellFormed() }] } } : {}),
       generationConfig,
-      ...(tools ? { tools } : {}),
-      ...(fcMode ? { toolConfig: { functionCallingConfig: { mode: fcMode } } } : {}),
+      ...(tools ? { tools, ...(fcMode ? { toolConfig: { functionCallingConfig: { mode: fcMode } } } : {}) } : {}),
       sessionId,
       labels: {
         last_step_index: String(Math.max(0, contents.length - 1)),
@@ -857,7 +876,6 @@ async function consumeSseStream(
     for (const part of candidate?.content?.parts ?? []) {
       if (part.text !== undefined) {
         const isThinking = part.thought === true;
-        if (!part.text && !part.thoughtSignature) continue;
         hasContent = true;
         const kind = isThinking ? "thinking" : "text";
         if (!active || active.type !== kind) {
@@ -904,6 +922,7 @@ async function consumeSseStream(
       output.rawStopReason = candidate.finishReason;
       const mapped = candidate.finishReason === "STOP" ? "stop" : candidate.finishReason === "MAX_TOKENS" ? "length" : "error";
       output.stopReason = mapped === "stop" && blocks.some((b) => b.type === "toolCall") ? "toolUse" : mapped;
+      if (output.stopReason === "length") ensureStarted();
     }
 
     if (payload.usageMetadata) {
@@ -947,7 +966,7 @@ async function consumeSseStream(
   }
 
   if (!sawFinishReason) throw new Error("Antigravity stream ended without a finish reason");
-  if (!hasContent && output.stopReason !== "error" && output.stopReason !== "aborted") {
+  if (!hasContent && output.stopReason === "stop") {
     throw new Error("Antigravity stream ended without any content");
   }
 }
@@ -993,7 +1012,6 @@ export function createStreamAntigravity(
         for (let i = 0; i < candidates.length; i++) {
           const runtimeModel = candidates[i]!;
           response = undefined;
-          let lastTransportError: Error | undefined;
           let sawCapacity429 = false;
           let tierStatus: number | undefined;
           let tierBody = "";
@@ -1015,8 +1033,7 @@ export function createStreamAntigravity(
             } catch (err) {
               if (options?.signal?.aborted) throw err;
               const transportErr = err instanceof Error ? err : new Error(String(err));
-              if (i === 0 && epIdx === 0) primaryTransportError = transportErr;
-              lastTransportError = transportErr;
+              if (i === 0) primaryTransportError ??= transportErr;
               continue;
             }
 
@@ -1050,7 +1067,6 @@ export function createStreamAntigravity(
           }
 
           if (response?.ok) break;
-          if (tierStatus === undefined && lastTransportError) throw lastTransportError;
           if (i === 0 && tierStatus !== undefined) {
             primaryStatus = tierStatus;
             primaryBody = tierBody;

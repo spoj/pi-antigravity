@@ -1,7 +1,7 @@
 import { createHash, randomBytes } from "node:crypto";
 import { createServer, type IncomingMessage, type Server, type ServerResponse } from "node:http";
 import type { FetchFunction, OAuthAuth, OAuthCredential, ProviderAuthInteraction } from "@earendil-works/pi-ai";
-import { PROVIDER_NAME, defaultProjectId, encodeApiKey, isRecord, loadCodeAssist, redactSecrets } from "./client.ts";
+import { PROVIDER_NAME, defaultProjectId, encodeApiKey, isRecord, loadCodeAssist, redactSecrets, withTimeout } from "./client.ts";
 
 export const REDIRECT_URI = "http://localhost:51121/oauth-callback";
 const AUTH_URL = "https://accounts.google.com/o/oauth2/v2/auth";
@@ -288,7 +288,10 @@ export function createAntigravityOAuth(fetchFn: FetchFunction = fetch): OAuthAut
 
         interaction.notify({ type: "progress", message: "Discovering Antigravity project…" });
         const [email, discovered] = await Promise.all([
-          fetchFn(USERINFO_URL, { headers: { Authorization: `Bearer ${tokens.access_token}` }, signal: interaction.signal })
+          fetchFn(USERINFO_URL, {
+            headers: { Authorization: `Bearer ${tokens.access_token}` },
+            signal: withTimeout(interaction.signal, 8_000),
+          })
             .then(async (r) => (r.ok ? ((await r.json()) as { email?: unknown }).email : undefined))
             .then((e) => (typeof e === "string" && e ? e : undefined))
             .catch(() => undefined),

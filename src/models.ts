@@ -298,9 +298,9 @@ export function getThinkingConfig(
   runtimeModel: string,
   reasoning?: ModelThinkingLevel,
 ): { includeThoughts: boolean; thinkingBudget: number } | undefined {
-  if (!model.reasoning) return undefined;
-  if (model.thinkingLevelMap?.off === runtimeModel) {
-    return runtimeModel.startsWith("gemini-4") ? undefined : { includeThoughts: false, thinkingBudget: 0 };
+  const isGemini2 = /^gemini-2(?:[.-]|$)/.test(runtimeModel);
+  if (!model.reasoning || model.thinkingLevelMap?.off === runtimeModel) {
+    return isGemini2 ? { includeThoughts: false, thinkingBudget: 0 } : undefined;
   }
   const clamped = reasoning && reasoning !== "off" ? clampThinkingLevel(model, reasoning) : undefined;
   const directMatch = clamped && model.thinkingLevelMap?.[clamped] === runtimeModel ? clamped : undefined;
@@ -308,13 +308,11 @@ export function getThinkingConfig(
     directMatch ??
     (["xhigh", "high", "medium", "low", "minimal"] as const).find((l) => model.thinkingLevelMap?.[l] === runtimeModel);
 
-  if ((!reasoning || reasoning === "off") && !mappedLevel) {
-    return runtimeModel.startsWith("gemini-4") ? undefined : { includeThoughts: false, thinkingBudget: 0 };
-  }
   if (!reasoning || reasoning === "off") {
     const requestedRuntime = resolveRuntimeModel(model, "off");
-    if (runtimeModel === requestedRuntime) {
-      return runtimeModel.startsWith("gemini-4") ? undefined : { includeThoughts: false, thinkingBudget: 0 };
+    if (!mappedLevel || runtimeModel === requestedRuntime) {
+      if (isGemini2) return { includeThoughts: false, thinkingBudget: 0 };
+      if (runtimeModel.startsWith("gemini-4")) return undefined;
     }
   }
   if (runtimeModel.startsWith("claude-")) return { includeThoughts: true, thinkingBudget: 1024 };

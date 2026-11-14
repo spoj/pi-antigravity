@@ -106,7 +106,7 @@ describe("stream request & SSE handling", () => {
     assert.equal(isContextOverflow({ stopReason: "error", errorMessage: overflow, usage: { input: 0, cacheRead: 0 } } as never), true);
   });
 
-  it("preserves primary transport errors, handles multi-line SSE, and uses provider-injected fetch", async () => {
+  it("preserves primary transport errors, fails over when fallback hits capacity 429, handles multi-line SSE, and preserves MAX_TOKENS", async () => {
     const prov = createAntigravityProvider(async (url) => {
       if (String(url).includes("daily-cloudcode-pa.googleapis.com")) throw new TypeError("fetch failed");
       return new Response("fallback routing error", { status: 403 });
@@ -117,6 +117,26 @@ describe("stream request & SSE handling", () => {
     assert.equal(isRetryableAssistantError(transportRes), true);
 
     const streamFn = createStreamAntigravity();
+    const sibRes = await streamFn(hydrogen, tx([{ role: "user", content: "hi", timestamp: 1 }]), {
+      apiKey: encodeApiKey("tok_1", "proj_1"),
+      fetch: async (url, init) => {
+        const body = JSON.parse(String(init?.body)) as { model: string };
+        if (body.model === "gemini-4-hydrogen-low") {
+          if (String(url).includes("daily-cloudcode-pa.googleapis.com")) throw new TypeError("fetch failed");
+          return new Response('{"error":{"code":429,"message":"Resource has been exhausted","status":"RESOURCE_EXHAUSTED"}}', { status: 429 });
+        }
+        return new Response('data: {"candidates":[{"content":{"parts":[{"text":"sib_ok"}]},"finishReason":"STOP"}]}\n\n', { status: 200 });
+      },
+    }).result();
+    assert.equal(sibRes.stopReason, "stop");
+    assert.deepEqual(sibRes.content, [{ type: "text", text: "sib_ok" }]);
+
+    const lenRes = await streamFn(hydrogen, tx([{ role: "user", content: "hi", timestamp: 1 }]), {
+      apiKey: encodeApiKey("tok_1", "proj_1"),
+      fetch: async () => new Response('data: {"candidates":[{"finishReason":"MAX_TOKENS"}]}\n\n', { status: 200 }),
+    }).result();
+    assert.equal(lenRes.stopReason, "length");
+
     const multiSse = [
       'data: {"candidates":[',
       'data: {"content":{"parts":[{"text":"ok"}]},"finishReason":"STOP"}]}',
