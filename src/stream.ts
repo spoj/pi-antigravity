@@ -24,6 +24,7 @@ import { getThinkingConfig, resolveRuntimeModel, siblingRuntimeModels } from "./
 
 const DEFAULT_STREAM_TIMEOUT_MS = 180_000;
 const CONTINUATION_TEXT = "Continue the active task from the conversation above.";
+const OMITTED_IMAGE_TEXT = "[Image omitted: model does not support image input]";
 const BASE64_SIG = /^[A-Za-z0-9+/]+={0,2}$/;
 
 type GeminiPart =
@@ -40,15 +41,28 @@ const isValidSig = (sig?: string): sig is string => Boolean(sig && sig.length % 
 const usesCustomBridge = (modelId: string, runtimeModel: string): boolean =>
   /^(claude|gpt-oss)-/.test(modelId) || /^(claude|gpt-oss)-/.test(runtimeModel);
 
-function sanitizeToolCallId(id: string, fallbackName?: string): string {
-  const cleaned = id.replace(/[^a-zA-Z0-9_-]/g, "_").slice(0, 64);
-  if (cleaned) return cleaned;
-  const prefix = (fallbackName ?? "tool").replace(/[^a-zA-Z0-9_-]/g, "_").slice(0, 32) || "tool";
-  return `${prefix}_${++toolIdCounter}`;
+function sanitizeToolCallId(id: string, fallbackName?: string, usedIds?: Set<string>): string {
+  const raw = id.replace(/[^a-zA-Z0-9_-]/g, "_");
+  let candidate = "";
+  if (/[a-zA-Z0-9]/.test(raw)) {
+    candidate =
+      raw.length <= 64
+        ? raw
+        : `${raw.slice(0, 48)}_${createHash("sha1").update(id).digest("hex").slice(0, 15)}`;
+  }
+  if (!candidate || usedIds?.has(candidate)) {
+    const prefix = (fallbackName ?? "tool").replace(/[^a-zA-Z0-9_-]/g, "_").slice(0, 28) || "tool";
+    do {
+      candidate = `${prefix}_${Date.now().toString(36)}_${++toolIdCounter}`;
+    } while (usedIds?.has(candidate));
+  }
+  usedIds?.add(candidate);
+  return candidate;
 }
 
-function toImagePart(block: ImageContent): GeminiPart | undefined {
+function toImagePart(block: ImageContent, allowImages: boolean): GeminiPart | undefined {
   if (!block.data) return undefined;
+  if (!allowImages) return { text: OMITTED_IMAGE_TEXT };
   const m = block.data.match(/^data:([^;]+);base64,(.+)$/s);
   const data = (m ? m[2]! : block.data).trim();
   return data ? { inlineData: { mimeType: block.mimeType || m?.[1] || "image/png", data } } : undefined;
@@ -61,6 +75,8 @@ function appendTurn(contents: GeminiContent[], role: "user" | "model", parts: Ge
   else contents.push({ role, parts: [...parts] });
 }
 
+type PendingCall = { name: string; wireId?: string; degradedArgs?: string };
+
 export function convertMessages(
   model: Model<Api>,
   messages: readonly Message[],
@@ -68,15 +84,56 @@ export function convertMessages(
 ): GeminiContent[] {
   const contents: GeminiContent[] = [];
   const requiresSig = runtimeModel.startsWith("gemini-") && !/^gemini-[12](?:[.-]|$)/.test(runtimeModel);
-  const needsId = usesCustomBridge(model.id, runtimeModel);
-  const droppedById = new Map<string, string>();
-  const droppedEmptyByName = new Map<string, string[]>();
-  const synthIdByName = new Map<string, string[]>();
+  const isClaude = model.id.startsWith("claude-") || runtimeModel.startsWith("claude-");
+  const needsId = usesCustomBridge(model.id, runtimeModel) || requiresSig;
+  const allowImages = model.input.includes("image");
+  const usedIds = new Set<string>();
+  const pendingByKey = new Map<string, PendingCall[]>();
+  const pendingOrder: PendingCall[] = [];
 
-  for (const msg of messages) {
+  const enqueuePending = (key: string, entry: PendingCall) => {
+    const list = pendingByKey.get(key) ?? [];
+    list.push(entry);
+    pendingByKey.set(key, list);
+    pendingOrder.push(entry);
+  };
+
+  const dequeuePending = (rawId: string, toolName: string): PendingCall | undefined => {
+    const key = rawId ? `id:${rawId}` : `name:${toolName}`;
+    const list = pendingByKey.get(key);
+    const entry = list?.shift();
+    if (list && list.length === 0) pendingByKey.delete(key);
+    if (entry) {
+      const idx = pendingOrder.indexOf(entry);
+      if (idx >= 0) pendingOrder.splice(idx, 1);
+    }
+    return entry;
+  };
+
+  const flushUnanswered = () => {
+    if (pendingOrder.length === 0) return;
+    const synthParts: GeminiPart[] = pendingOrder.map((p) =>
+      p.degradedArgs !== undefined
+        ? { text: `[Observation from ${p.degradedArgs === "{}" ? p.name : `${p.name} (${p.degradedArgs})`}:\nNo result provided]` }
+        : {
+            functionResponse: {
+              name: p.name,
+              response: { error: "No result provided" },
+              ...(p.wireId ? { id: p.wireId } : {}),
+            },
+          },
+    );
+    pendingOrder.length = 0;
+    pendingByKey.clear();
+    appendTurn(contents, "user", synthParts);
+  };
+
+  for (let idx = 0; idx < messages.length; idx++) {
+    const msg = messages[idx]!;
     if (msg.role === "system") continue;
 
     if (msg.role === "user") {
+      flushUnanswered();
       const parts: GeminiPart[] =
         typeof msg.content === "string"
           ? msg.content.trim()
@@ -84,7 +141,7 @@ export function convertMessages(
             : []
           : msg.content.flatMap((item) => {
               if (item.type === "text") return item.text.trim() ? [{ text: item.text.toWellFormed() }] : [];
-              const img = toImagePart(item);
+              const img = toImagePart(item, allowImages);
               return img ? [img] : [];
             });
       appendTurn(contents, "user", parts);
@@ -93,6 +150,7 @@ export function convertMessages(
 
     if (msg.role === "assistant") {
       if (msg.stopReason === "error" || msg.stopReason === "aborted") continue;
+      flushUnanswered();
       const parts: GeminiPart[] = [];
       const isSameModel = msg.provider === PROVIDER_ID && msg.model === model.id;
       const toolCalls = msg.content.filter((b): b is ToolCall => b.type === "toolCall");
@@ -101,6 +159,17 @@ export function convertMessages(
         toolCalls.length > 0 &&
         isValidSig(toolCalls[0]?.thoughtSignature) &&
         toolCalls.every((tc) => !tc.thoughtSignature || isValidSig(tc.thoughtSignature));
+      const turnHasSig =
+        isSameModel &&
+        msg.content.some(
+          (b) =>
+            (b.type === "thinking" && isValidSig(b.thinkingSignature)) ||
+            (b.type === "text" && isValidSig(b.textSignature)) ||
+            (b.type === "toolCall" && isValidSig(b.thoughtSignature)),
+        );
+
+      // Trailing assistant toolCall with zero subsequent messages is an incomplete request from caller.
+      const isFinalMessage = !messages.slice(idx + 1).some((m) => m.role !== "system");
 
       for (const block of msg.content) {
         if (block.type === "text") {
@@ -109,37 +178,35 @@ export function convertMessages(
           parts.push({ text: block.text.toWellFormed(), ...(sig ? { thoughtSignature: sig } : {}) });
         } else if (block.type === "thinking") {
           const sig = isSameModel && isValidSig(block.thinkingSignature) ? block.thinkingSignature : undefined;
-          if (!isSameModel || (!block.thinking.trim() && !sig) || (requiresSig && !sig && !groupSigned)) continue;
+          if (!isSameModel || (!block.thinking.trim() && !sig)) continue;
+          if ((requiresSig && !sig && !turnHasSig) || (isClaude && !sig)) continue;
           parts.push({ thought: true, text: block.thinking.toWellFormed(), ...(sig ? { thoughtSignature: sig } : {}) });
         } else if (block.type === "toolCall") {
           const rawId = block.id || "";
+          const key = rawId ? `id:${rawId}` : `name:${block.name}`;
           if (requiresSig && !groupSigned) {
             const argsJson = JSON.stringify(block.arguments ?? {});
-            if (rawId) droppedById.set(rawId, argsJson);
-            else droppedEmptyByName.set(block.name, [...(droppedEmptyByName.get(block.name) ?? []), argsJson]);
+            if (!isFinalMessage) enqueuePending(key, { name: block.name, degradedArgs: argsJson });
           } else {
-            if (rawId) droppedById.delete(rawId);
-            else droppedEmptyByName.delete(block.name);
-            let wireId: string | undefined;
-            if (needsId) {
-              wireId = sanitizeToolCallId(rawId, block.name);
-              if (!rawId.replace(/[^a-zA-Z0-9_-]/g, "")) {
-                synthIdByName.set(block.name, [...(synthIdByName.get(block.name) ?? []), wireId]);
-              }
-            }
+            const wireId = needsId ? sanitizeToolCallId(rawId, block.name, usedIds) : undefined;
+            const callSig = isSameModel && isValidSig(block.thoughtSignature) ? block.thoughtSignature : undefined;
+            if (!isFinalMessage) enqueuePending(key, { name: block.name, wireId });
             parts.push({
               functionCall: {
                 name: block.name,
-                args: (block.arguments ?? {}) as Record<string, unknown>,
+                args: structuredClone((block.arguments ?? {}) as Record<string, unknown>),
                 ...(wireId ? { id: wireId } : {}),
               },
-              ...(block.thoughtSignature ? { thoughtSignature: block.thoughtSignature } : {}),
+              ...(callSig ? { thoughtSignature: callSig } : {}),
             });
           }
         }
       }
 
       if (parts.length === 0 && requiresSig && !groupSigned && toolCalls.length > 0) {
+        if (isFinalMessage) {
+          throw new Error("Antigravity request is missing tool result(s) for the final assistant tool call.");
+        }
         parts.push({ text: "[Earlier tool call omitted because its signature is unavailable.]" });
       }
       appendTurn(contents, "model", parts);
@@ -154,20 +221,16 @@ export function convertMessages(
       const responseText = text || (msg.isError ? "Tool failed" : "");
       const images = msg.content
         .filter((c): c is ImageContent => c.type === "image")
-        .map(toImagePart)
+        .map((img) => toImagePart(img, allowImages))
         .filter((p): p is GeminiPart => p !== undefined);
 
       const rawId = msg.toolCallId || "";
-      const droppedArgs = requiresSig ? (rawId ? droppedById.get(rawId) : droppedEmptyByName.get(msg.toolName)?.shift()) : undefined;
-      if (droppedArgs !== undefined) {
-        if (rawId) droppedById.delete(rawId);
-        const label = droppedArgs === "{}" ? msg.toolName : `${msg.toolName} (${droppedArgs})`;
+      const matched = dequeuePending(rawId, msg.toolName);
+      if (matched?.degradedArgs !== undefined) {
+        const label = matched.degradedArgs === "{}" ? msg.toolName : `${msg.toolName} (${matched.degradedArgs})`;
         appendTurn(contents, "user", [{ text: `[Observation from ${label}:\n${responseText}]` }, ...images]);
       } else {
-        const wireId = needsId
-          ? (!rawId.replace(/[^a-zA-Z0-9_-]/g, "") ? synthIdByName.get(msg.toolName)?.shift() : undefined) ??
-            sanitizeToolCallId(rawId, msg.toolName)
-          : undefined;
+        const wireId = needsId ? (matched?.wireId ?? sanitizeToolCallId(rawId, msg.toolName, usedIds)) : undefined;
         appendTurn(contents, "user", [
           {
             functionResponse: {
@@ -181,6 +244,8 @@ export function convertMessages(
       }
     }
   }
+
+  flushUnanswered();
 
   for (let i = 0; i < contents.length; i++) {
     if (contents[i]!.role === "model" && contents[i]!.parts.some((p) => "functionCall" in p) && contents[i - 1]?.role !== "user") {
@@ -207,7 +272,7 @@ export function convertMessages(
 }
 
 const SCHEMA_MAPS = new Set(["properties", "patternProperties", "dependentSchemas", "dependencies"]);
-const LITERAL_KEYS = new Set(["enum", "const", "default", "examples"]);
+const LITERAL_KEYS = new Set(["enum", "default", "examples"]);
 const META_KEYS = new Set(["$schema", "$id", "$anchor", "$dynamicAnchor", "$vocabulary", "$comment", "$defs", "definitions"]);
 const CUSTOM_TOOL_ALLOW = new Set(["type", "description", "properties", "required", "items", "enum"]);
 
@@ -233,16 +298,41 @@ function resolvePointer(ref: string, root: unknown): unknown {
 function toCustomToolSchema(schema: unknown): unknown {
   if (!schema || typeof schema !== "object") return schema;
   if (Array.isArray(schema)) return schema.map(toCustomToolSchema);
+  const rec = schema as Record<string, unknown>;
+
+  // Collapse JSON Schema unions (anyOf / oneOf from TypeBox Type.Union) for Cloud Code Assist's protobuf Schema bridge.
+  const branches = Array.isArray(rec.anyOf) ? rec.anyOf : Array.isArray(rec.oneOf) ? rec.oneOf : undefined;
+  if (branches) {
+    const nonNull = branches.filter((b): b is Record<string, unknown> => isRecord(b) && b.type !== "null");
+    if (
+      nonNull.length > 0 &&
+      nonNull.every((b) => Array.isArray(b.enum) && b.enum.every((x) => typeof x === "string"))
+    ) {
+      const mergedEnum = [...new Set(nonNull.flatMap((b) => b.enum as string[]))];
+      return {
+        type: "string",
+        enum: mergedEnum,
+        ...(typeof rec.description === "string" ? { description: rec.description } : {}),
+      };
+    }
+    if (nonNull.length === 1) {
+      const single = toCustomToolSchema(nonNull[0]);
+      return isRecord(single) && typeof rec.description === "string" && !single.description
+        ? { ...single, description: rec.description }
+        : single;
+    }
+  }
+
   const out: Record<string, unknown> = {};
-  for (const [k, v] of Object.entries(schema)) {
+  for (const [k, v] of Object.entries(rec)) {
     if (!CUSTOM_TOOL_ALLOW.has(k)) continue;
     if (k === "type") {
       const scalar = typeof v === "string" ? v : Array.isArray(v) ? v.find((x): x is string => typeof x === "string" && x !== "null") : undefined;
-      if (scalar) out.type = scalar;
+      if (scalar && scalar !== "null") out.type = scalar;
     } else if (k === "properties" && isRecord(v)) {
       out.properties = Object.fromEntries(Object.entries(v).map(([p, s]) => [p, toCustomToolSchema(s)]));
     } else if (k === "enum") {
-      if (Array.isArray(v) && v.every((x) => typeof x === "string")) out.enum = v;
+      if (Array.isArray(v) && v.every((x) => typeof x === "string")) out.enum = [...v];
     } else {
       out[k] = toCustomToolSchema(v);
     }
@@ -276,12 +366,15 @@ export function convertTools(tools: readonly Tool[] | undefined, useCustomBridge
       const out: Record<string, unknown> = {};
       for (const [k, v] of Object.entries(rec)) {
         if (META_KEYS.has(k)) continue;
-        if (SCHEMA_MAPS.has(k) && isRecord(v)) {
+        if (k === "const") {
+          out.enum = [structuredClone(v)];
+          if (typeof v === "string" && rec.type === undefined) out.type = "string";
+        } else if (SCHEMA_MAPS.has(k) && isRecord(v)) {
           out[k] = Object.fromEntries(Object.entries(v).map(([p, s]) => [p, clean(s, refs, nextObjs, depth + 1)]));
-        } else if (!LITERAL_KEYS.has(k)) {
-          out[k] = clean(v, refs, nextObjs, depth + 1);
+        } else if (LITERAL_KEYS.has(k)) {
+          out[k] = structuredClone(v);
         } else {
-          out[k] = v;
+          out[k] = clean(v, refs, nextObjs, depth + 1);
         }
       }
       return out;
@@ -403,15 +496,25 @@ export function buildRequest(
   };
 }
 
+const isRateLimit429 = (t: string): boolean =>
+  /rate.?limit|too many requests|per minute|requests per|tokens per minute/i.test(t);
+
 const isQuotaWall429 = (t: string): boolean =>
-  /Individual quota reached|Resets? in |AI credits balance is too low|INSUFFICIENT_G1_CREDITS/i.test(t) ||
-  (!/rate.?limit/i.test(t) && /quota exceeded|exceeded your|limit reached|reached your|daily limit/i.test(t));
+  !isRateLimit429(t) &&
+  (/Individual quota reached|Resets? in |AI credits balance is too low|INSUFFICIENT_G1_CREDITS/i.test(t) ||
+    /quota exceeded|exceeded your|limit reached|reached your|daily limit/i.test(t));
 
 const isGenericCapacity429 = (t: string): boolean =>
-  !isQuotaWall429(t) && !/rate.?limit|too many requests/i.test(t) && /resource has been exhausted|RESOURCE_EXHAUSTED/i.test(t);
+  !isQuotaWall429(t) && !isRateLimit429(t) && /resource has been exhausted|RESOURCE_EXHAUSTED/i.test(t);
 
 const OVERFLOW_RE =
   /exceeds the maximum|context[_ ]length[_ ]exceeded|prompt is too long|too many tokens|maximum context length|request payload size exceeds/i;
+
+function trimTrailingPunct(s: string): string {
+  let end = s.length;
+  while (end > 0 && ".,;)".includes(s[end - 1]!)) end--;
+  return s.slice(0, end);
+}
 
 export function formatApiError(status: number | undefined, rawText: string): string {
   let extracted = rawText;
@@ -422,22 +525,33 @@ export function formatApiError(status: number | undefined, rawText: string): str
     // plain text
   }
   const msg = redactSecrets(extracted).trim();
-  if (status === 413 || OVERFLOW_RE.test(msg)) return status === 413 ? `413: ${msg || "Payload too large"}` : msg;
   const short = msg.slice(0, 500);
+
+  if (status === 429) {
+    if (isQuotaWall429(short)) {
+      const wait = short.match(/Resets? in ([^.\n]+)/i)?.[1]?.trim();
+      return `Antigravity quota reached${wait ? ` (resets in ${wait})` : ""}. Switch models or retry after reset.`;
+    }
+    if (isGenericCapacity429(short)) {
+      const clean = short.replace(/429|RESOURCE_EXHAUSTED|ResourceExhausted/gi, "exhausted");
+      return `Antigravity model unavailable right now (${clean || "capacity exhausted"}). Switch models or retry later.`;
+    }
+    const safeThrottle = short
+      .replace(/quota exceeded|exceeded your|too many tokens/gi, "throttled")
+      .slice(0, 200);
+    return `429 Rate limited by Antigravity${safeThrottle ? `: ${safeThrottle}` : ""}`;
+  }
+
+  if (status === 413 || OVERFLOW_RE.test(msg)) {
+    return status === 413 ? `413: ${short || "Payload too large"}` : `context_length_exceeded: ${short}`;
+  }
   if (status === 401) return "Antigravity authentication failed. Run /login antigravity and retry.";
   if (status === 403) {
-    const rawLink = rawText.match(/https:\/\/accounts\.google\.com\/[^\s"'<>\\]+/)?.[0];
-    const safeLink = rawLink ? redactSecrets(rawLink.replace(/[.,;)]+$/, "")) : undefined;
+    const rawLink = rawText.slice(0, 4096).match(/https:\/\/accounts\.google\.com\/[^\s"'<>\\]{1,500}/)?.[0];
+    const safeLink = rawLink ? redactSecrets(trimTrailingPunct(rawLink)) : undefined;
     return `Antigravity access denied: ${short || "forbidden"}.${safeLink ? ` Verify account: ${safeLink}` : ""}`;
   }
   if (status === 408) return `Antigravity request timed out (408): ${short || "timeout"}`;
-  if (status === 429) {
-    if (/rate.?limit|too many requests/i.test(short)) return `429 Rate limited by Antigravity: ${short}`;
-    const wait = short.match(/Resets? in ([^.\n]+)/i)?.[1]?.trim();
-    if (isQuotaWall429(short)) return `Antigravity quota reached${wait ? ` (resets in ${wait})` : ""}. Switch models or retry after reset.`;
-    const clean = short.replace(/429|RESOURCE_EXHAUSTED|ResourceExhausted/gi, "exhausted");
-    return `Antigravity model unavailable right now (${clean || "capacity exhausted"}). Switch models or retry later.`;
-  }
   if (status !== undefined && status >= 500) return `Antigravity server error (${status}): ${short || "unavailable"}`;
   return status !== undefined ? `Antigravity request failed (${status}): ${short || "unknown error"}` : short || "Antigravity request failed";
 }
@@ -492,6 +606,29 @@ async function fetchWithHeaderDeadline(
   }
 }
 
+async function readTextWithDeadline(response: Response, timeoutMs: number, signal?: AbortSignal): Promise<string> {
+  if (timeoutMs <= 0 && !signal) return response.text();
+  let timer: ReturnType<typeof setTimeout> | undefined;
+  const onAbort = () => void response.body?.cancel().catch(() => {});
+  signal?.addEventListener("abort", onAbort, { once: true });
+  try {
+    const textPromise = response.text();
+    if (timeoutMs <= 0) return await textPromise;
+    return await Promise.race([
+      textPromise,
+      new Promise<never>((_, reject) => {
+        timer = setTimeout(() => {
+          void response.body?.cancel().catch(() => {});
+          reject(new Error(`Antigravity error response timed out after ${timeoutMs}ms`));
+        }, timeoutMs);
+      }),
+    ]);
+  } finally {
+    if (timer) clearTimeout(timer);
+    signal?.removeEventListener("abort", onAbort);
+  }
+}
+
 async function readWithDeadline(
   reader: ReadableStreamDefaultReader<Uint8Array>,
   timeoutMs: number,
@@ -531,6 +668,7 @@ async function consumeSseStream(
   const reader = response.body.getReader();
   const decoder = new TextDecoder();
   const blocks = output.content;
+  const usedIds = new Set<string>();
   let buffer = "";
   let stray = "";
   let started = false;
@@ -558,46 +696,61 @@ async function consumeSseStream(
   };
 
   const handleLine = async (line: string) => {
+    if (options?.signal?.aborted) throw new Error("Request was aborted");
     if (!line.startsWith("data:")) {
       const trimmed = line.trim();
-      if (!trimmed || trimmed.startsWith(":")) return;
-      stray = stray ? `${stray}\n${trimmed}` : trimmed;
-      const brace = stray.indexOf("{");
-      if (brace < 0) return;
+      if (!trimmed) {
+        stray = "";
+        return;
+      }
+      if (trimmed.startsWith(":") || /^(?:event|id|retry):/i.test(trimmed)) return;
+      if (stray.length < 4096) stray = stray ? `${stray}\n${trimmed}` : trimmed;
+      const start = Math.min(
+        stray.indexOf("{") >= 0 ? stray.indexOf("{") : Infinity,
+        stray.indexOf("[") >= 0 ? stray.indexOf("[") : Infinity,
+      );
+      if (!Number.isFinite(start)) return;
       let parsed: unknown;
       try {
-        parsed = JSON.parse(stray.slice(brace));
+        parsed = JSON.parse(stray.slice(start));
       } catch {
         return;
       }
-      if (isRecord(parsed) && "error" in parsed) {
-        const code = isRecord(parsed.error) && typeof parsed.error.code === "number" ? parsed.error.code : undefined;
-        throw new Error(formatApiError(code, stray.slice(brace)));
+      const errItem = Array.isArray(parsed) ? parsed[0] : parsed;
+      if (isRecord(errItem) && isRecord(errItem.error)) {
+        const code = typeof errItem.error.code === "number" ? errItem.error.code : undefined;
+        throw new Error(formatApiError(code, JSON.stringify({ error: errItem.error })));
       }
+      stray = "";
       return;
     }
 
+    stray = "";
     const json = line.slice(5).trim();
     if (!json || json === "[DONE]") return;
-    let chunk: StreamChunk;
+    let rawChunk: unknown;
     try {
-      chunk = JSON.parse(json) as StreamChunk;
+      rawChunk = JSON.parse(json);
     } catch {
       return;
     }
+    if (!isRecord(rawChunk)) return;
+    const chunk = rawChunk as StreamChunk;
 
     await options?.onProviderStreamEvent?.(chunk, model);
+    if (options?.signal?.aborted) throw new Error("Request was aborted");
     if (chunk.error) throw new Error(formatApiError(chunk.error.code, JSON.stringify({ error: chunk.error })));
 
-    const payload = chunk.response ?? chunk;
+    const payload = isRecord(chunk.response) ? chunk.response : chunk;
     if (payload.modelVersion) output.responseModel = payload.modelVersion;
     if (payload.responseId) output.responseId = payload.responseId;
     const candidate = payload.candidates?.[0];
 
     for (const part of candidate?.content?.parts ?? []) {
       if (part.text !== undefined) {
-        hasContent = true;
         const isThinking = part.thought === true;
+        if (!part.text && !part.thoughtSignature) continue;
+        hasContent = true;
         const kind = isThinking ? "thinking" : "text";
         if (!active || active.type !== kind) {
           finishActive();
@@ -610,11 +763,11 @@ async function consumeSseStream(
         if (active.type === "thinking") {
           active.thinking += part.text;
           if (part.thoughtSignature) active.thinkingSignature = part.thoughtSignature;
-          stream.push({ type: "thinking_delta", contentIndex, delta: part.text, partial: output });
+          if (part.text) stream.push({ type: "thinking_delta", contentIndex, delta: part.text, partial: output });
         } else {
           active.text += part.text;
           if (part.thoughtSignature) active.textSignature = part.thoughtSignature;
-          stream.push({ type: "text_delta", contentIndex, delta: part.text, partial: output });
+          if (part.text) stream.push({ type: "text_delta", contentIndex, delta: part.text, partial: output });
         }
       }
 
@@ -624,7 +777,7 @@ async function consumeSseStream(
         const args: JsonObject = isRecord(part.functionCall.args) ? (part.functionCall.args as JsonObject) : {};
         const toolCall: ToolCall = {
           type: "toolCall",
-          id: sanitizeToolCallId(part.functionCall.id ?? "", part.functionCall.name),
+          id: sanitizeToolCallId(part.functionCall.id ?? "", part.functionCall.name, usedIds),
           name: part.functionCall.name ?? "",
           arguments: args,
           ...(part.thoughtSignature ? { thoughtSignature: part.thoughtSignature } : {}),
@@ -671,10 +824,11 @@ async function consumeSseStream(
     }
     buffer += decoder.decode();
     if (buffer.length > 0) await handleLine(buffer.replace(/\r$/, ""));
+    if (options?.signal?.aborted) throw new Error("Request was aborted");
     completed = true;
-  } finally {
     finishActive();
-    if (!completed) await reader.cancel().catch(() => {});
+  } finally {
+    if (!completed) void reader.cancel().catch(() => {});
     reader.releaseLock();
   }
 
@@ -715,15 +869,18 @@ export function createStreamAntigravity(getModelEnum?: (runtimeModel: string) =>
         const endpoints = endpointsFor(model.baseUrl);
 
         let response: Response | undefined;
-        let lastStatus: number | undefined;
-        let lastBody = "";
+        let primaryStatus: number | undefined;
+        let primaryBody = "";
 
         for (let i = 0; i < candidates.length; i++) {
           const runtimeModel = candidates[i]!;
           response = undefined;
           let lastTransportError: Error | undefined;
+          let sawCapacity429 = false;
+          let tierStatus: number | undefined;
+          let tierBody = "";
 
-          for (const endpoint of endpoints) {
+          for (let epIdx = 0; epIdx < endpoints.length; epIdx++) {
             if (options?.signal?.aborted) throw new Error("Request was aborted");
             let payload: unknown = buildRequest(model, context, creds.projectId, options, runtimeModel, getModelEnum?.(runtimeModel));
             const rewritten = await options?.onPayload?.(payload, model);
@@ -732,7 +889,7 @@ export function createStreamAntigravity(getModelEnum?: (runtimeModel: string) =>
             try {
               response = await fetchWithHeaderDeadline(
                 fetchFn,
-                `${endpoint}/v1internal:streamGenerateContent?alt=sse`,
+                `${endpoints[epIdx]!}/v1internal:streamGenerateContent?alt=sse`,
                 { method: "POST", headers, body: JSON.stringify(payload) },
                 options?.signal,
                 timeoutMs,
@@ -744,16 +901,33 @@ export function createStreamAntigravity(getModelEnum?: (runtimeModel: string) =>
             }
 
             if (response.ok) break;
-            lastStatus = response.status;
-            lastBody = await response.text();
-            if (response.status === 429 && isGenericCapacity429(lastBody)) continue;
-            if (![403, 404, 500, 502, 503, 504].includes(response.status)) break;
+            const status = response.status;
+            const bodyText = await readTextWithDeadline(response, timeoutMs, options?.signal).catch(() => "");
+
+            // Keep the primary endpoint's error rather than letting sandbox 403 / prod 404 mask it.
+            if (epIdx === 0 || tierStatus === undefined) {
+              tierStatus = status;
+              tierBody = bodyText;
+            }
+            if (status === 429 && isGenericCapacity429(bodyText)) {
+              sawCapacity429 = true;
+              continue;
+            }
+            if (![403, 404, 500, 502, 503, 504].includes(status)) {
+              tierStatus = status;
+              tierBody = bodyText;
+              break;
+            }
           }
 
-          if (!response && lastTransportError) throw lastTransportError;
           if (response?.ok) break;
+          if (i === 0 && tierStatus !== undefined) {
+            primaryStatus = tierStatus;
+            primaryBody = tierBody;
+          }
+          if (!response && lastTransportError && primaryStatus === undefined) throw lastTransportError;
 
-          if (response?.status === 429 && isGenericCapacity429(lastBody) && candidates.length < 4) {
+          if (sawCapacity429 && candidates.length < 4) {
             const nextSibling = siblingRuntimeModels(model, runtimeModel).find((id) => !candidates.includes(id));
             if (nextSibling) {
               candidates.splice(i + 1, 0, nextSibling);
@@ -763,18 +937,25 @@ export function createStreamAntigravity(getModelEnum?: (runtimeModel: string) =>
           break;
         }
 
-        if (response) {
+        if (response?.ok) {
           try {
             await options?.onResponse?.({ status: response.status, headers: Object.fromEntries(response.headers.entries()) }, model);
           } catch (err) {
-            await response.body?.cancel().catch(() => {});
+            void response.body?.cancel().catch(() => {});
             throw err;
           }
+        } else {
+          if (response) {
+            await options?.onResponse?.(
+              { status: primaryStatus ?? response.status, headers: Object.fromEntries(response.headers.entries()) },
+              model,
+            );
+          }
+          throw new Error(formatApiError(primaryStatus ?? response?.status, primaryBody));
         }
 
-        if (!response || !response.ok) throw new Error(formatApiError(lastStatus ?? response?.status, lastBody));
-
         await consumeSseStream(response, stream, output, model, timeoutMs, options);
+        if (options?.signal?.aborted) throw new Error("Request was aborted");
 
         if (output.stopReason === "error" || output.stopReason === "aborted") {
           output.errorMessage ||= output.rawStopReason ? `Provider stopped with: ${output.rawStopReason}` : "Antigravity generation failed";

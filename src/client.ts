@@ -68,7 +68,7 @@ export function redactSecrets(text: string): string {
     .replace(/\bGOCSPX-[A-Za-z0-9._-]+/g, "[REDACTED]")
     .replace(/\beyJ[A-Za-z0-9_-]{8,}\.[A-Za-z0-9_-]{8,}\.[A-Za-z0-9_-]{8,}/g, "[REDACTED]")
     .replace(
-      /(["']?(?:access_token|refresh_token|client_secret|id_token|code_verifier|api_key|x-goog-api-key|authorization)["']?\s*[:=]\s*)(?:"(?:\\.|[^"])*"|'[^']*'|[^&\s"',}]+)/gi,
+      /((\\?["'])?(?:access_token|refresh_token|client_secret|id_token|code_verifier|api_key|x-goog-api-key|authorization)(?:\\?["'])?\s*[:=]\s*)(?:\\?"(?:[^"\\]|\\.)*(?:\\?"|$)|'(?:[^'\\]|\\.)*(?:'|$)|[^&\s"',}]+)/gi,
       "$1[REDACTED]",
     )
     .replace(/([?&#]|^)((?:access_token|refresh_token|client_secret|id_token|code|code_verifier)=)[^&\s#"']+/gi, "$1$2[REDACTED]");
@@ -131,9 +131,10 @@ function extractProjectId(data: unknown): string | undefined {
 
 export async function loadCodeAssist(
   token: string,
-  options?: { signal?: AbortSignal; fetch?: FetchFunction; baseUrl?: string },
+  options?: { signal?: AbortSignal; fetch?: FetchFunction; baseUrl?: string; timeoutMs?: number },
 ): Promise<string | undefined> {
   const fetchFn = options?.fetch ?? fetch;
+  const timeoutMs = options?.timeoutMs ?? DISCOVERY_TIMEOUT_MS;
   for (const endpoint of endpointsFor(options?.baseUrl)) {
     if (options?.signal?.aborted) throw new Error("Request was aborted");
     try {
@@ -141,10 +142,10 @@ export async function loadCodeAssist(
         method: "POST",
         headers: buildHeaders(token),
         body: JSON.stringify({ metadata: { ideType: "ANTIGRAVITY" } }),
-        signal: withTimeout(options?.signal, DISCOVERY_TIMEOUT_MS),
+        signal: withTimeout(options?.signal, timeoutMs),
       });
       if (!res.ok) {
-        await res.body?.cancel().catch(() => {});
+        void res.body?.cancel().catch(() => {});
         continue;
       }
       const direct = extractProjectId(await res.json());
@@ -154,13 +155,13 @@ export async function loadCodeAssist(
         method: "POST",
         headers: buildHeaders(token),
         body: "{}",
-        signal: withTimeout(options?.signal, DISCOVERY_TIMEOUT_MS),
+        signal: withTimeout(options?.signal, timeoutMs),
       });
       if (listRes.ok) {
         const listed = extractProjectId(await listRes.json());
         if (listed) return listed;
       } else {
-        await listRes.body?.cancel().catch(() => {});
+        void listRes.body?.cancel().catch(() => {});
       }
     } catch (err) {
       if (options?.signal?.aborted) throw err;
@@ -185,7 +186,7 @@ export async function fetchAvailableModelsCatalog(
           signal: withTimeout(options?.signal, DISCOVERY_TIMEOUT_MS),
         });
         if (!res.ok) {
-          await res.body?.cancel().catch(() => {});
+          void res.body?.cancel().catch(() => {});
           return undefined;
         }
         return (await res.json()) as unknown;
@@ -199,12 +200,16 @@ export async function fetchAvailableModelsCatalog(
   const recommendedIds = new Set<string>();
   let matched = false;
 
+  // Endpoints are ordered [daily, sandbox, prod]: keep first-seen (freshest) model metadata unless earlier entry marked it disabled.
   for (const raw of payloads) {
     if (!isRecord(raw) || !isRecord(raw.models)) continue;
     const entries = Object.entries(raw.models).filter(([, v]) => isRecord(v)) as Array<[string, ModelInfoRaw]>;
     if (entries.length === 0) continue;
     matched = true;
-    for (const [id, info] of entries) models[id] = info;
+    for (const [id, info] of entries) {
+      const prev = models[id];
+      if (!prev || (prev.disabled === true && info.disabled !== true)) models[id] = info;
+    }
     if (!Array.isArray(raw.agentModelSorts)) continue;
     for (const sort of raw.agentModelSorts) {
       if (!isRecord(sort) || !Array.isArray(sort.groups)) continue;

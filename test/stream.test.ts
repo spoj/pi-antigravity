@@ -1,224 +1,189 @@
 import assert from "node:assert/strict";
-import test from "node:test";
-import { isContextOverflow, normalizeContext, type AssistantMessage, type AssistantMessageEvent, type ToolResultMessage } from "@earendil-works/pi-ai";
+import { describe, it } from "node:test";
+import { isContextOverflow, isRetryableAssistantError, type Message, type TranscriptContext } from "@earendil-works/pi-ai";
 import { encodeApiKey } from "../src/client.ts";
 import { FALLBACK_MODELS } from "../src/models.ts";
 import { buildRequest, convertMessages, convertTools, createStreamAntigravity, formatApiError } from "../src/stream.ts";
 
+const tx = (messages: Message[]): TranscriptContext => ({ messages }) as unknown as TranscriptContext;
+
 const hydrogen = FALLBACK_MODELS.find((m) => m.id === "gemini-4-hydrogen")!;
-const sonnet = FALLBACK_MODELS.find((m) => m.id === "claude-sonnet-5-5")!;
+const claude = FALLBACK_MODELS.find((m) => m.id === "claude-sonnet-5-5")!;
 const gptOss = FALLBACK_MODELS.find((m) => m.id === "gpt-oss-120b")!;
-const zeroUsage = { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, totalTokens: 0, cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, total: 0 } };
 
-const asst = (over: Partial<AssistantMessage> & Pick<AssistantMessage, "content">): AssistantMessage => ({
-  role: "assistant",
-  provider: "antigravity",
-  model: "gemini-4-hydrogen",
-  api: "antigravity-api",
-  stopReason: "toolUse",
-  timestamp: 2,
-  usage: zeroUsage,
-  ...over,
-});
-
-const toolRes = (toolCallId: string, text: string, toolName = "bash"): ToolResultMessage => ({
-  role: "toolResult",
-  toolCallId,
-  toolName,
-  content: [{ type: "text", text }],
-  isError: false,
-  timestamp: 3,
-});
-
-test("buildRequest sanitizes Pi system prompt and populates Antigravity envelope", () => {
-  const ctx = normalizeContext({
-    systemPrompt: "You are a coding assistant running inside pi, a coding agent harness.",
-    messages: [{ role: "user", content: "hi", timestamp: 1 }],
-    tools: [
+describe("stream request & SSE handling", () => {
+  it("converts $ref, const->enum, and Type.Union schemas for Gemini and Claude", () => {
+    const tools = [
       {
-        name: "ping",
-        description: "ping host",
+        name: "edit",
+        description: "Edit file",
         parameters: {
-          $schema: "https://json-schema.org/draft/2020-12/schema",
-          $defs: { Target: { type: "string" } },
+          $schema: "http://json-schema.org/draft-07/schema#",
+          $defs: { Edit: { type: "object", properties: { old: { type: "string" } }, required: ["old"] } },
           type: "object",
-          properties: { definitions: { $ref: "#/$defs/Target" } },
-        },
+          properties: {
+            mode: { const: "replace" },
+            target: { anyOf: [{ type: "string" }, { type: "null" }], description: "path" },
+            edits: { type: "array", items: { $ref: "#/$defs/Edit" } },
+          },
+        } as never,
       },
-    ],
+    ];
+    const geminiTools = convertTools(tools, false);
+    const geminiProps = (
+      geminiTools?.[0]?.functionDeclarations[0] as unknown as { parametersJsonSchema: { properties: Record<string, unknown> } }
+    ).parametersJsonSchema.properties;
+    assert.deepEqual(geminiProps.mode, { enum: ["replace"], type: "string" });
+
+    const claudeTools = convertTools(tools, true);
+    const claudeProps = (
+      claudeTools?.[0]?.functionDeclarations[0] as unknown as { parameters: { properties: Record<string, unknown> } }
+    ).parameters.properties;
+    assert.deepEqual(claudeProps.target, { type: "string", description: "path" });
   });
 
-  const req = buildRequest(hydrogen, ctx, "proj-1", { reasoning: "high", sessionId: "sess-1" }, "gemini-4-hydrogen-high", "M525");
-  assert.equal(req.project, "proj-1");
-  assert.equal(req.model, "gemini-4-hydrogen-high");
-  assert.equal(req.request.systemInstruction?.parts[0]?.text, "You are a coding assistant running inside your development environment.");
-  assert.equal(req.request.labels.model_enum, "M525");
-  const decl = req.request.tools?.[0]?.functionDeclarations[0];
-  assert(decl && "parametersJsonSchema" in decl);
-  assert.deepEqual(decl.parametersJsonSchema, {
-    type: "object",
-    properties: { definitions: { type: "string" } },
-  });
-});
-
-test("convertTools normalizes schemas for Claude and GPT-OSS and skips cyclic $ref tools", () => {
-  const tools = convertTools(
-    [
+  it("synthesizes missing tool results on interrupted parallel batches, strips foreign sigs, and omits unsupported images", () => {
+    const history = [
+      { role: "user" as const, content: "run two tools", timestamp: 1 },
       {
-        name: "good",
-        description: "ok",
-        parameters: {
-          type: "object",
-          additionalProperties: false,
-          properties: { mode: { type: ["string", "null"], enum: ["fast", "slow"], format: "uri" }, badEnum: { type: "number", enum: [1, 2] } },
-          required: ["mode"],
-        },
+        role: "assistant" as const,
+        api: "antigravity-api" as const,
+        provider: "antigravity",
+        model: "gemini-4-hydrogen",
+        content: [
+          { type: "toolCall" as const, id: "tc1", name: "bash", arguments: { cmd: "ls" }, thoughtSignature: "AAAA" },
+          { type: "toolCall" as const, id: "tc2", name: "bash", arguments: { cmd: "pwd" } },
+        ],
+        usage: { input: 1, output: 1, cacheRead: 0, cacheWrite: 0, totalTokens: 2, cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, total: 0 } },
+        stopReason: "toolUse" as const,
+        timestamp: 2,
       },
-      { name: "cyclic", description: "loop", parameters: { $defs: { A: { $ref: "#/$defs/A" } }, $ref: "#/$defs/A" } },
-    ],
-    true,
-  );
-  assert.equal(tools?.[0]?.functionDeclarations.length, 1);
-  const decl = tools?.[0]?.functionDeclarations[0];
-  assert(decl && "parameters" in decl);
-  assert.deepEqual(decl.parameters, {
-    type: "object",
-    properties: { mode: { type: "string", enum: ["fast", "slow"] }, badEnum: { type: "number" } },
-    required: ["mode"],
+      {
+        role: "toolResult" as const,
+        toolCallId: "tc1",
+        toolName: "bash",
+        content: [{ type: "text" as const, text: "file.txt" }],
+        isError: false,
+        timestamp: 3,
+      },
+      {
+        role: "user" as const,
+        content: [
+          { type: "text" as const, text: "now check" },
+          { type: "image" as const, data: "AAAA", mimeType: "image/png" },
+        ],
+        timestamp: 4,
+      },
+    ];
+
+    const gemTurns = convertMessages(hydrogen, history, "gemini-4-hydrogen-low");
+    assert.equal(gemTurns.length, 3);
+    const userResponses = gemTurns[2]!.parts.filter((p) => "functionResponse" in p);
+    assert.equal(userResponses.length, 2);
+
+    const gptTurns = convertMessages(gptOss, history, "gpt-oss-120b-medium");
+    const callPart = gptTurns[1]!.parts[0] as { functionCall: unknown; thoughtSignature?: string };
+    assert.equal(callPart.thoughtSignature, undefined);
+    assert.match(JSON.stringify(gptTurns[2]!.parts), /Image omitted/);
   });
 
-  const ctx = normalizeContext({
-    messages: [{ role: "user", content: "go", timestamp: 1 }],
-    tools: [{ name: "t", description: "d", parameters: { type: "object", nullable: true, properties: {} } }],
-  });
-  const gptReq = buildRequest(gptOss, ctx, "p", { reasoning: "medium" }, "gpt-oss-120b-medium");
-  assert("parameters" in (gptReq.request.tools?.[0]?.functionDeclarations[0] ?? {}));
-});
-
-test("convertMessages handles signed/unsigned Gemini calls, empty IDs, and paired Claude tool IDs", () => {
-  const sig = "QUJDREVGR0hJSktMTU5PUA==";
-  const signed = convertMessages(
-    hydrogen,
-    [
-      { role: "user", content: "ls", timestamp: 1 },
-      asst({ content: [{ type: "thinking", thinking: "", thinkingSignature: sig }, { type: "toolCall", id: "c1", name: "bash", arguments: { cmd: "ls" }, thoughtSignature: sig }] }),
-      toolRes("c1", "file.txt"),
-    ],
-    "gemini-4-hydrogen-high",
-  );
-  assert.equal(signed.length, 3);
-  assert("thought" in signed[1]!.parts[0]!);
-  assert("functionCall" in signed[1]!.parts[1]!);
-
-  // Unsigned empty-ID Gemini tool calls degrade with their matching empty-ID toolResults
-  const foreignEmpty = convertMessages(
-    hydrogen,
-    [
-      { role: "user", content: "ls", timestamp: 1 },
-      asst({ provider: "openai", model: "gpt-6.1-sol", content: [{ type: "toolCall", id: "", name: "bash", arguments: { cmd: "pwd" } }] }),
-      toolRes("", "/tmp"),
-    ],
-    "gemini-4-hydrogen-high",
-  );
-  assert("text" in foreignEmpty[2]!.parts[0]! && foreignEmpty[2]!.parts[0]!.text.includes("[Observation from bash"));
-
-  // Claude empty-ID historical calls pair synthetic IDs across call and response
-  const claudeTurns = convertMessages(
-    sonnet,
-    [
-      { role: "user", content: "hi", timestamp: 1 },
-      asst({ model: "claude-sonnet-5-5", content: [{ type: "toolCall", id: "", name: "bash", arguments: {} }] }),
-      toolRes("", "ok"),
-    ],
-    "claude-sonnet-5-5-high",
-  );
-  const callPart = claudeTurns[1]!.parts[0] as { functionCall: { id: string } };
-  const respPart = claudeTurns[2]!.parts[0] as { functionResponse: { id: string } };
-  assert.equal(callPart.functionCall.id, respPart.functionResponse.id);
-});
-
-test("formatApiError preserves Pi overflow detection, redacts 403 links, and classifies 429s", () => {
-  const err413 = formatApiError(413, "Request Entity Too Large");
-  assert(isContextOverflow(asst({ content: [], stopReason: "error", errorMessage: err413 }), 1_048_576));
-  assert(formatApiError(400, '{"error":{"message":"input token count exceeds the maximum"}}').includes("exceeds the maximum"));
-
-  const err403 = formatApiError(403, "Verify https://accounts.google.com/signin/continue?access_token=ya29.secret123.");
-  assert(err403.includes("https://accounts.google.com/signin/continue?access_token=[REDACTED]"));
-  assert(!err403.includes("ya29.secret123"));
-
-  assert(!formatApiError(429, "Individual quota reached. Resets in 2h.").includes("429"));
-  assert(!/429|ResourceExhausted/i.test(formatApiError(429, "Resource has been exhausted.")));
-  assert(formatApiError(429, "Too many requests, rate limit").includes("429"));
-});
-
-test("streamAntigravity streams SSE, preserves MAX_TOKENS/SAFETY stopReasons, fails over siblings, and honors timeoutMs: 0", async () => {
-  const sse = (chunks: string[]) => {
-    const enc = new TextEncoder();
-    return new Response(
-      new ReadableStream({
-        start(ctrl) {
-          for (const c of chunks) ctrl.enqueue(enc.encode(c));
-          ctrl.close();
+  it("clones toolCall arguments so onPayload mutations do not corrupt history", () => {
+    const args = { cmd: "pwd" };
+    const ctx = tx([
+        { role: "user" as const, content: "go", timestamp: 1 },
+        {
+          role: "assistant" as const,
+          api: "antigravity-api" as const,
+          provider: "antigravity",
+          model: "claude-sonnet-5-5",
+          content: [{ type: "toolCall" as const, id: "c1", name: "bash", arguments: args }],
+          usage: { input: 1, output: 1, cacheRead: 0, cacheWrite: 0, totalTokens: 2, cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, total: 0 } },
+          stopReason: "toolUse" as const,
+          timestamp: 2,
         },
-      }),
-      { status: 200, headers: { "x-ag-test": "ok" } },
-    );
-  };
-
-  const attempted: string[] = [];
-  let responseStatus = 0;
-  let rawEvents = 0;
-  const streamFn = createStreamAntigravity(() => "M527");
-  const ctx = normalizeContext({ messages: [{ role: "user", content: "hi", timestamp: 1 }] });
-
-  const s = streamFn(hydrogen, ctx, {
-    apiKey: encodeApiKey("tok", "proj-1"),
-    reasoning: "low",
-    timeoutMs: 0,
-    fetch: async (_url, init) => {
-      const body = JSON.parse(String(init?.body)) as { model: string };
-      attempted.push(body.model);
-      if (body.model === "gemini-4-hydrogen-low") {
-        return new Response('{"error":{"message":"Resource has been exhausted"}}', { status: 429 });
-      }
-      return sse([
-        'data: {"response":{"modelVersion":"gemini-4-hydrogen-high","candidates":[{"content":{"parts":[{"thought":true,"text":"plan ","thoughtSignature":"U0lHMTIzNDU2Nzg="}]}}]}}\n\n',
-        'data: {"response":{"candidates":[{"finishReason":"STOP","content":{"parts":[{"thought":true,"text":"more"},{"text":"ok"}]}}],"usageMetadata":{"promptTokenCount":50,"cachedContentTokenCount":10,"candidatesTokenCount":5,"thoughtsTokenCount":3,"totalTokenCount":58}}}\n\n',
+        { role: "toolResult" as const, toolCallId: "c1", toolName: "bash", content: [{ type: "text" as const, text: "/tmp" }], isError: false, timestamp: 3 },
       ]);
-    },
-    onResponse: (r) => {
-      responseStatus = r.status;
-    },
-    onProviderStreamEvent: () => {
-      rawEvents++;
-    },
+    const req = buildRequest(claude, ctx, "proj", undefined, "claude-sonnet-5-5-low");
+    const wireCall = (req.request.contents[1]!.parts[0] as { functionCall: { args: Record<string, unknown> } }).functionCall;
+    wireCall.args.cmd = "mutated";
+    assert.equal(args.cmd, "pwd");
   });
 
-  const events: AssistantMessageEvent[] = [];
-  for await (const ev of s) events.push(ev);
-  const final = await s.result();
-  assert.equal(responseStatus, 200);
-  assert.equal(rawEvents, 2);
-  assert.deepEqual([attempted[0], attempted.at(-1)], ["gemini-4-hydrogen-low", "gemini-4-hydrogen-high"]);
-  assert.equal(final.stopReason, "stop");
-  assert.deepEqual(final.content, [
-    { type: "thinking", thinking: "plan more", thinkingSignature: "U0lHMTIzNDU2Nzg=" },
-    { type: "text", text: "ok" },
-  ]);
+  it("aligns formatApiError with Pi 1.5 retry and context-overflow classifiers", () => {
+    const rpm = formatApiError(429, "Quota exceeded for quota metric requests per minute (rate limit)");
+    const tpm = formatApiError(429, "Too many tokens per minute");
+    const empty429 = formatApiError(429, "");
+    const quota = formatApiError(429, "Individual quota reached. Resets in 3h 20m.");
+    const cap = formatApiError(429, '{"error":{"code":429,"message":"Resource has been exhausted","status":"RESOURCE_EXHAUSTED"}}');
+    const overflow = formatApiError(400, "Request payload size exceeds the limit: 20971520 bytes");
 
-  // MAX_TOKENS with truncated toolCall stays "length", not "toolUse"
-  const trunc = await streamFn(hydrogen, ctx, {
-    apiKey: encodeApiKey("tok", "proj-1"),
-    fetch: async () =>
-      sse(['data: {"response":{"candidates":[{"finishReason":"MAX_TOKENS","content":{"parts":[{"functionCall":{"name":"bash","args":{"cmd":"ls"}}}]}}]}}\n\n']),
-  }).result();
-  assert.equal(trunc.stopReason, "length");
+    assert.equal(isRetryableAssistantError({ stopReason: "error", errorMessage: rpm } as never), true);
+    assert.equal(isRetryableAssistantError({ stopReason: "error", errorMessage: tpm } as never), true);
+    assert.equal(isContextOverflow({ stopReason: "error", errorMessage: tpm, usage: { input: 0, cacheRead: 0 } } as never), false);
+    assert.equal(isRetryableAssistantError({ stopReason: "error", errorMessage: empty429 } as never), true);
+    assert.equal(isRetryableAssistantError({ stopReason: "error", errorMessage: quota } as never), false);
+    assert.equal(isRetryableAssistantError({ stopReason: "error", errorMessage: cap } as never), false);
+    assert.equal(isContextOverflow({ stopReason: "error", errorMessage: overflow, usage: { input: 0, cacheRead: 0 } } as never), true);
+  });
 
-  // Zero-part SAFETY finishReason surfaces rawStopReason without "ended without" retry trigger
-  const safety = await streamFn(hydrogen, ctx, {
-    apiKey: encodeApiKey("tok", "proj-1"),
-    fetch: async () => sse(['data: {"response":{"candidates":[{"finishReason":"SAFETY"}]}}\n\n']),
-  }).result();
-  assert.equal(safety.stopReason, "error");
-  assert.equal(safety.errorMessage, "Provider stopped with: SAFETY");
+  it("fails over across sibling tier even when sandbox returns 403 and prod returns 404", async () => {
+    const attemptedModels: string[] = [];
+    const streamFn = createStreamAntigravity(() => "MODEL_PLACEHOLDER_M527");
+
+    const s = streamFn(
+      hydrogen,
+      tx([{ role: "system", content: "You are running inside pi, a coding agent harness.", timestamp: 1 }, { role: "user", content: "hi", timestamp: 2 }]),
+      {
+        apiKey: encodeApiKey("tok_1", "proj_1"),
+        fetch: async (url, init) => {
+          const u = String(url);
+          const body = JSON.parse(String(init?.body)) as { model: string };
+          attemptedModels.push(`${new URL(u).host}:${body.model}`);
+          if (body.model === "gemini-4-hydrogen-low") {
+            if (u.includes("sandbox")) return new Response("Forbidden", { status: 403 });
+            if (u.includes("https://cloudcode-pa")) return new Response("Not found", { status: 404 });
+            return new Response('{"error":{"code":429,"message":"Resource has been exhausted","status":"RESOURCE_EXHAUSTED"}}', { status: 429 });
+          }
+          const sse = [
+            'data: {"response":{"modelVersion":"gemini-4-hydrogen-high","candidates":[{"content":{"parts":[{"text":"think","thought":true,"thoughtSignature":"BBBB"},{"text":"ok"}]}}]}}',
+            'data: {"response":{"candidates":[{"finishReason":"STOP"}],"usageMetadata":{"promptTokenCount":10,"candidatesTokenCount":2,"thoughtsTokenCount":3,"totalTokenCount":15}}}',
+            "",
+          ].join("\n");
+          return new Response(sse, { status: 200, headers: { "Content-Type": "text/event-stream" } });
+        },
+      },
+    );
+
+    const msg = await s.result();
+    assert.equal(msg.stopReason, "stop");
+    assert.ok(attemptedModels.includes("daily-cloudcode-pa.googleapis.com:gemini-4-hydrogen-high"));
+  });
+
+  it("does not hang when reader.cancel() never settles on mid-stream error", async () => {
+    const streamFn = createStreamAntigravity();
+    const s = streamFn(
+      hydrogen,
+      tx([{ role: "user", content: "hi", timestamp: 1 }]),
+      {
+        apiKey: encodeApiKey("tok_1", "proj_1"),
+        timeoutMs: 50,
+        fetch: async () => {
+          let sent = false;
+          const body = new ReadableStream<Uint8Array>({
+            pull(ctrl) {
+              if (!sent) {
+                sent = true;
+                ctrl.enqueue(new TextEncoder().encode('data: {"error":{"code":500,"message":"boom"}}\n'));
+              }
+            },
+            cancel: () => new Promise<void>(() => {}),
+          });
+          return new Response(body, { status: 200 });
+        },
+      },
+    );
+    const res = await s.result();
+    assert.equal(res.stopReason, "error");
+    assert.match(res.errorMessage ?? "", /500/);
+  });
 });

@@ -1,5 +1,5 @@
 import { createHash, randomBytes } from "node:crypto";
-import { createServer, type ServerResponse } from "node:http";
+import { createServer, type IncomingMessage, type Server, type ServerResponse } from "node:http";
 import type { FetchFunction, OAuthAuth, OAuthCredential, ProviderAuthInteraction } from "@earendil-works/pi-ai";
 import { PROVIDER_NAME, defaultProjectId, encodeApiKey, isRecord, loadCodeAssist, redactSecrets } from "./client.ts";
 
@@ -9,6 +9,7 @@ const TOKEN_URL = "https://oauth2.googleapis.com/token";
 const USERINFO_URL = "https://www.googleapis.com/oauth2/v1/userinfo?alt=json";
 const CALLBACK_PORT = 51121;
 const CALLBACK_TIMEOUT_MS = 5 * 60 * 1000;
+const REFRESH_DISCOVERY_BUDGET_MS = 3_000;
 const SCOPES = ["aicode", "cloud-platform", "userinfo.email", "userinfo.profile", "cclog", "experimentsandconfigs"]
   .map((s) => `https://www.googleapis.com/auth/${s}`)
   .join(" ");
@@ -30,20 +31,31 @@ export function parseCallbackInput(raw: string, expectedState: string): string {
       return new URL(`${REDIRECT_URI}?${text.replace(/^\?/, "")}`);
     }
   })();
+  const state = url.searchParams.get("state");
+  if (!state) throw new Error("Callback URL is missing state.");
+  if (state !== expectedState) throw new Error("OAuth state mismatch. Start /login antigravity again.");
   const error = url.searchParams.get("error");
   if (error) {
     throw new Error(`OAuth error: ${redactSecrets(url.searchParams.get("error_description") ?? error).slice(0, 200)}`);
   }
   const code = url.searchParams.get("code");
-  const state = url.searchParams.get("state");
-  if (!code || !state) throw new Error("Callback URL is missing code or state.");
-  if (state !== expectedState) throw new Error("OAuth state mismatch. Start /login antigravity again.");
+  if (!code) throw new Error("Callback URL is missing code.");
   return code;
 }
 
 type CallbackHandle = { wait: Promise<string>; close: () => void };
 
-async function startCallbackServer(expectedState: string, signal: AbortSignal): Promise<CallbackHandle> {
+function isPortConflict(err: unknown): boolean {
+  const code = (err as NodeJS.ErrnoException | undefined)?.code;
+  return code === "EADDRINUSE" || code === "EACCES";
+}
+
+function isIpv6Unavailable(err: unknown): boolean {
+  const code = (err as NodeJS.ErrnoException | undefined)?.code;
+  return code === "EAFNOSUPPORT" || code === "EADDRNOTAVAIL";
+}
+
+export async function startCallbackServer(expectedState: string, signal: AbortSignal): Promise<CallbackHandle> {
   if (signal.aborted) throw new Error("Login cancelled");
   let resolveCode!: (code: string) => void;
   let rejectCode!: (error: Error) => void;
@@ -55,6 +67,7 @@ async function startCallbackServer(expectedState: string, signal: AbortSignal): 
 
   let settled = false;
   let timer: ReturnType<typeof setTimeout> | undefined;
+  const servers: Server[] = [];
   const onAbort = () => settle(() => rejectCode(new Error("Login cancelled")));
   const settle = (fn: () => void) => {
     if (settled) return;
@@ -70,7 +83,7 @@ async function startCallbackServer(expectedState: string, signal: AbortSignal): 
     res.end(`<!doctype html><meta charset="utf-8"><title>${esc(title)}</title><body style="font-family:system-ui,sans-serif;padding:2rem"><h2>${esc(title)}</h2>${detail ? `<p>${esc(detail)}</p>` : ""}</body>`);
   };
 
-  const server = createServer((req, res) => {
+  const handleReq = (req: IncomingMessage, res: ServerResponse) => {
     let url: URL;
     try {
       url = new URL(req.url ?? "/", REDIRECT_URI);
@@ -82,6 +95,11 @@ async function startCallbackServer(expectedState: string, signal: AbortSignal): 
       sendHtml(res, 404, "Callback route not found.");
       return;
     }
+    const state = url.searchParams.get("state");
+    if (state !== expectedState) {
+      sendHtml(res, 400, `${PROVIDER_NAME} sign-in failed.`, "OAuth state mismatch.");
+      return;
+    }
     try {
       const code = parseCallbackInput(url.toString(), expectedState);
       sendHtml(res, 200, `Signed in to ${PROVIDER_NAME}.`, "You may close this tab.");
@@ -89,24 +107,50 @@ async function startCallbackServer(expectedState: string, signal: AbortSignal): 
     } catch (err) {
       const msg = err instanceof Error ? err.message : String(err);
       sendHtml(res, 400, `${PROVIDER_NAME} sign-in failed.`, msg);
-      if (url.searchParams.has("error")) settle(() => rejectCode(new Error(msg)));
+      settle(() => rejectCode(new Error(msg)));
     }
-  });
+  };
 
-  const host = process.env.PI_OAUTH_CALLBACK_HOST || "127.0.0.1";
-  await new Promise<void>((resolve, reject) => {
-    server.once("error", reject);
-    server.listen(CALLBACK_PORT, host, () => {
-      server.off("error", reject);
-      resolve();
-    });
-  });
-  if (signal.aborted) {
-    server.close();
-    throw new Error("Login cancelled");
+  const closeAll = () => {
+    for (const s of servers) {
+      s.closeAllConnections?.();
+      s.close();
+    }
+  };
+
+  const bindHost = async (host: string, optional = false) => {
+    const srv = createServer(handleReq);
+    try {
+      await new Promise<void>((resolve, reject) => {
+        srv.once("error", reject);
+        srv.listen({ port: CALLBACK_PORT, host, ipv6Only: host === "::1" }, () => {
+          srv.off("error", reject);
+          resolve();
+        });
+      });
+      srv.on("error", (err) => settle(() => rejectCode(err)));
+      servers.push(srv);
+    } catch (err) {
+      srv.close();
+      if (optional && isIpv6Unavailable(err)) return;
+      throw err;
+    }
+  };
+
+  const explicitHost = process.env.PI_OAUTH_CALLBACK_HOST?.trim();
+  try {
+    if (explicitHost) {
+      await bindHost(explicitHost);
+    } else {
+      await bindHost("127.0.0.1");
+      await bindHost("::1", true);
+    }
+    if (signal.aborted) throw new Error("Login cancelled");
+  } catch (err) {
+    closeAll();
+    throw err;
   }
 
-  server.on("error", (err) => settle(() => rejectCode(err)));
   signal.addEventListener("abort", onAbort, { once: true });
   timer = setTimeout(() => settle(() => rejectCode(new Error("Timed out waiting for Google sign-in."))), CALLBACK_TIMEOUT_MS);
 
@@ -116,8 +160,7 @@ async function startCallbackServer(expectedState: string, signal: AbortSignal): 
       settled = true;
       if (timer) clearTimeout(timer);
       signal.removeEventListener("abort", onAbort);
-      server.closeAllConnections?.();
-      server.close();
+      closeAll();
     },
   };
 }
@@ -142,7 +185,7 @@ async function acquireAuthCode(
           signal: promptSignal,
         });
       } catch (err) {
-        if (callback && !interaction.signal.aborted) return new Promise<string>(() => {});
+        if (manualAbort.signal.aborted && !interaction.signal.aborted) return new Promise<string>(() => {});
         throw err instanceof Error ? err : new Error(String(err));
       }
       try {
@@ -153,6 +196,7 @@ async function acquireAuthCode(
       }
     }
   })();
+  manualPrompt.catch(() => undefined);
 
   try {
     return callback ? await Promise.race([callback.wait, manualPrompt]) : await manualPrompt;
@@ -177,18 +221,18 @@ export function createAntigravityOAuth(fetchFn: FetchFunction = fetch): OAuthAut
       signal,
     });
     if (!res.ok) {
-      const safe = redactSecrets(await res.text()).trim();
-      let detail = safe.slice(0, 300) || "unknown OAuth error";
+      const raw = await res.text().catch(() => "");
+      let detail = "";
       try {
-        const p: unknown = JSON.parse(safe);
+        const p: unknown = JSON.parse(raw);
         if (isRecord(p)) {
           const parts = [p.error, p.error_description].filter((v): v is string => typeof v === "string" && Boolean(v));
-          if (parts.length) detail = parts.join(": ").slice(0, 300);
+          if (parts.length) detail = redactSecrets(parts.join(": ")).slice(0, 200);
         }
       } catch {
-        // non-JSON
+        // non-JSON body: omit raw text to prevent leaking echoed parameters
       }
-      throw new Error(`Antigravity ${label} failed: ${detail}`);
+      throw new Error(`Antigravity ${label} failed (${res.status})${detail ? `: ${detail}` : ""}`);
     }
     return (await res.json()) as { access_token?: string; refresh_token?: string; expires_in?: number };
   };
@@ -197,6 +241,7 @@ export function createAntigravityOAuth(fetchFn: FetchFunction = fetch): OAuthAut
     name: PROVIDER_NAME,
     isSubscription: true,
     async login(interaction): Promise<OAuthCredential> {
+      if (interaction.signal.aborted) throw new Error("Login cancelled");
       const verifier = randomBytes(32).toString("base64url");
       const challenge = createHash("sha256").update(verifier).digest("base64url");
       const state = randomBytes(16).toString("hex");
@@ -212,7 +257,15 @@ export function createAntigravityOAuth(fetchFn: FetchFunction = fetch): OAuthAut
         prompt: "consent",
       });
 
-      const callback = await startCallbackServer(state, interaction.signal).catch(() => undefined);
+      const callback = await startCallbackServer(state, interaction.signal).catch((err) => {
+        if (isPortConflict(err)) return undefined;
+        throw err;
+      });
+      if (interaction.signal.aborted) {
+        callback?.close();
+        throw new Error("Login cancelled");
+      }
+
       interaction.notify({
         type: "auth_url",
         url: `${AUTH_URL}?${params.toString()}`,
@@ -264,9 +317,13 @@ export function createAntigravityOAuth(fetchFn: FetchFunction = fetch): OAuthAut
       const email = typeof credential.email === "string" ? credential.email : undefined;
       const storedProj = typeof credential.projectId === "string" && credential.projectId ? credential.projectId : undefined;
       const isRealProj = storedProj && storedProj !== defaultProjectId(email) && storedProj !== defaultProjectId();
-      const projectId =
-        (isRealProj ? storedProj : await loadCodeAssist(data.access_token, { signal, fetch: fetchFn })) ||
-        defaultProjectId(email);
+      const discovered = isRealProj
+        ? storedProj
+        : await loadCodeAssist(data.access_token, {
+            signal,
+            fetch: fetchFn,
+            timeoutMs: REFRESH_DISCOVERY_BUDGET_MS,
+          }).catch(() => undefined);
 
       return {
         ...credential,
@@ -274,7 +331,7 @@ export function createAntigravityOAuth(fetchFn: FetchFunction = fetch): OAuthAut
         access: data.access_token,
         refresh: data.refresh_token || credential.refresh,
         expires: Date.now() + data.expires_in * 1000 - 5 * 60 * 1000,
-        projectId,
+        projectId: discovered || defaultProjectId(email),
       };
     },
 
