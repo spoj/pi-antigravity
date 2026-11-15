@@ -22,6 +22,10 @@ Requires Node >= 22.19.0 and Pi >= 1.5.2.
 2. Pick a model with `/model` (for example `antigravity/gemini-4-hydrogen`, `antigravity/gemini-4-carbon`, `antigravity/gemini-4-argon`, `antigravity/gemini-3.8-flash`, `antigravity/claude-opus-5-5`, `antigravity/claude-sonnet-5-5`, or `antigravity/gpt-oss-120b`) and thinking level with `/thinking`.
 3. Interactive sessions refresh the model catalog automatically on startup (cached in `~/.pi/agent/models-store.json`). Sign out anytime with `/logout antigravity`.
 
+## Troubleshooting
+
+Antigravity can return `RESOURCE_EXHAUSTED` for specific system-prompt wording even when quota remains. The provider rewords known Pi boilerplate while preserving instructions, file paths, and tools. Other capacity failures can still occur.
+
 ## Development
 
 ```bash

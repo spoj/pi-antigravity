@@ -12,6 +12,33 @@ const claude = FALLBACK_MODELS.find((m) => m.id === "claude-sonnet-5-5")!;
 const gptOss = FALLBACK_MODELS.find((m) => m.id === "gpt-oss-120b")!;
 
 describe("stream request & SSE handling", () => {
+  it("rewords rejected Pi boilerplate without dropping instructions, paths, or tools", () => {
+    const system = {
+      role: "system" as const,
+      content: "",
+      sections: {
+        preamble: "You are a coding assistant running inside pi, a coding agent harness. Help users inspect files, run commands, and modify code.",
+        docs: "Read /opt/pi-coding-agent/docs for codemode scripts and non-LLM models such as classifiers and image models (docs/codemode.md).",
+        project_context: "Never send email on my behalf.",
+      },
+      toolsAdded: [{ name: "bash", description: "Execute commands", parameters: { type: "object", properties: {} } }],
+      timestamp: 1,
+    };
+    const before = structuredClone(system);
+    const context = tx([system, { role: "user", content: "hi", timestamp: 2 }] as Message[]);
+    const request = buildRequest(hydrogen, context, "project", { reasoning: "high" }, "gemini-4-hydrogen-high").request;
+    const prompt = request.systemInstruction!.parts[0]!.text;
+    assert.ok(prompt.includes("You are a coding assistant. Help users inspect files, run commands, and modify code."));
+    assert.ok(prompt.includes("Read /opt/pi-coding-agent/docs for codemode scripts, classifiers, and image models (docs/codemode.md)."));
+    assert.ok(prompt.includes("Never send email on my behalf."));
+    assert.equal(request.tools![0]!.functionDeclarations[0]!.name, "bash");
+    assert.deepEqual(system, before);
+
+    const custom = "Discuss Pi and non-LLM models. Keep /opt/pi-coding-agent/docs unchanged.";
+    const unchanged = buildRequest(hydrogen, tx([{ role: "system", content: custom, timestamp: 1 }]), "project", undefined, "gemini-4-hydrogen-low");
+    assert.equal(unchanged.request.systemInstruction!.parts[0]!.text, custom);
+  });
+
   it("converts percent-encoded $ref, multi-branch unions, tuples, and strict sampling", () => {
     const tools = [
       {

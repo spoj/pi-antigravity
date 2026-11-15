@@ -525,9 +525,14 @@ export function buildRequest(
   runtimeModel: string,
   modelEnum?: string,
 ) {
+  // These Pi boilerplate phrases trigger prompt-dependent RESOURCE_EXHAUSTED responses.
   const systemPrompt = getCurrentSystemPrompt(context.messages)
-    ?.replace(/running inside pi(?:, a coding agent harness)?/gi, "running inside your development environment")
-    .replace(/inside pi, a coding agent harness/gi, "inside your development environment");
+    ?.replace(/ running inside pi(?:, a coding agent harness)?/gi, "")
+    .replace(/inside pi, a coding agent harness/gi, "inside your development environment")
+    .replace(
+      /codemode scripts and non-LLM models such as classifiers and image models/gi,
+      "codemode scripts, classifiers, and image models",
+    );
 
   const contents = convertMessages(model, context.messages, runtimeModel);
   if (contents.length === 0) {
