@@ -28,12 +28,12 @@ function createMockPi(initialTools = ["read", "bash"]) {
   return { tools, emit, getActiveTools: () => [...activeTools] };
 }
 
-describe("gemini-4-neon yield tool", () => {
-  it("activates yield for any provider's gemini-4-neon model and deactivates for other models", async () => {
+describe("gemini-4-neon stand_by tool", () => {
+  it("activates stand_by for any provider's gemini-4-neon model and deactivates for other models", async () => {
     const mock = createMockPi();
     assert.equal(mock.tools.length, 1);
     const tool = mock.tools[0]!;
-    assert.equal(tool.name, "yield");
+    assert.equal(tool.name, "stand_by");
     assert.equal(tool.exposure, "model-only");
     assert.equal(tool.defaultActive, false);
 
@@ -41,19 +41,19 @@ describe("gemini-4-neon yield tool", () => {
     assert.equal(execResult.terminate, true);
 
     mock.emit("session_start", {}, { model: { provider: "google", id: "gemini-4-neon" }, mode: "tui" });
-    assert.deepEqual(mock.getActiveTools(), ["read", "bash", "yield"]);
+    assert.deepEqual(mock.getActiveTools(), ["read", "bash", "stand_by"]);
 
     mock.emit("model_select", { model: { provider: "openrouter", id: "google/gemini-4-neon-preview" } }, { mode: "rpc" });
-    assert.deepEqual(mock.getActiveTools(), ["read", "bash", "yield"]);
+    assert.deepEqual(mock.getActiveTools(), ["read", "bash", "stand_by"]);
 
     mock.emit("model_select", { model: { provider: "antigravity", id: "gemini-4-carbon" } }, { mode: "tui" });
     assert.deepEqual(mock.getActiveTools(), ["read", "bash"]);
 
     mock.emit("model_select", { model: { provider: "antigravity", id: "gemini-4-neon" } }, { mode: "tui" });
-    assert.deepEqual(mock.getActiveTools(), ["read", "bash", "yield"]);
+    assert.deepEqual(mock.getActiveTools(), ["read", "bash", "stand_by"]);
   });
 
-  it("does not activate yield in print or json modes", () => {
+  it("does not activate stand_by in print or json modes", () => {
     const mock = createMockPi();
     mock.emit("session_start", {}, { model: { provider: "antigravity", id: "gemini-4-neon" }, mode: "print" });
     assert.deepEqual(mock.getActiveTools(), ["read", "bash"]);

@@ -26,31 +26,30 @@ export default function antigravityExtension(pi: ExtensionAPI): void {
   pi.registerProvider(createAntigravityProvider());
 
   pi.registerTool({
-    name: "yield",
-    label: "Yield",
-    description:
-      "End your turn and wait for pending background work (running monitor or async message) instead of ending with text alone.",
+    name: "stand_by",
+    label: "Stand By",
+    description: "End the current turn and wait for the next message or background completion.",
     parameters: { type: "object", properties: {} },
     exposure: "model-only",
     defaultActive: false,
     async execute() {
       return {
-        content: [{ type: "text", text: "Yielded turn; waiting for next message." }],
+        content: [{ type: "text", text: "Standing by." }],
         details: undefined,
         terminate: true,
       };
     },
   });
 
-  const syncYield = (modelId: string | undefined, mode: string) => {
+  const syncStandBy = (modelId: string | undefined, mode: string) => {
     if (mode === "print" || mode === "json") return;
     const active = pi.getActiveTools();
-    const has = active.includes("yield");
+    const has = active.includes("stand_by");
     const want = isNeon(modelId);
-    if (want && !has) pi.setActiveTools([...active, "yield"]);
-    else if (!want && has) pi.setActiveTools(active.filter((t) => t !== "yield"));
+    if (want && !has) pi.setActiveTools([...active, "stand_by"]);
+    else if (!want && has) pi.setActiveTools(active.filter((t) => t !== "stand_by"));
   };
 
-  pi.on("session_start", (_e, ctx) => syncYield(ctx.model?.id, ctx.mode));
-  pi.on("model_select", (e, ctx) => syncYield(e.model.id, ctx.mode));
+  pi.on("session_start", (_e, ctx) => syncStandBy(ctx.model?.id, ctx.mode));
+  pi.on("model_select", (e, ctx) => syncStandBy(e.model.id, ctx.mode));
 }
