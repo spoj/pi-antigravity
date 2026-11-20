@@ -5,6 +5,8 @@ import { DEFAULT_ENDPOINT, PROVIDER_ID, PROVIDER_NAME, type AntigravityApi } fro
 import { createCatalogManager } from "./models.ts";
 import { createStreamAntigravity } from "./stream.ts";
 
+const isNeon = (id?: string) => id?.toLowerCase().includes("gemini-4-neon") ?? false;
+
 export function createAntigravityProvider(fetchFn?: FetchFunction): Provider<AntigravityApi> {
   const catalog = createCatalogManager(fetchFn);
   const stream = createStreamAntigravity(catalog.getModelEnum, fetchFn);
@@ -22,4 +24,33 @@ export function createAntigravityProvider(fetchFn?: FetchFunction): Provider<Ant
 
 export default function antigravityExtension(pi: ExtensionAPI): void {
   pi.registerProvider(createAntigravityProvider());
+
+  pi.registerTool({
+    name: "yield",
+    label: "Yield",
+    description:
+      "End your turn and wait for pending background work (running monitor or async message) instead of ending with text alone.",
+    parameters: { type: "object", properties: {} },
+    exposure: "model-only",
+    defaultActive: false,
+    async execute() {
+      return {
+        content: [{ type: "text", text: "Yielded turn; waiting for next message." }],
+        details: undefined,
+        terminate: true,
+      };
+    },
+  });
+
+  const syncYield = (modelId: string | undefined, mode: string) => {
+    if (mode === "print" || mode === "json") return;
+    const active = pi.getActiveTools();
+    const has = active.includes("yield");
+    const want = isNeon(modelId);
+    if (want && !has) pi.setActiveTools([...active, "yield"]);
+    else if (!want && has) pi.setActiveTools(active.filter((t) => t !== "yield"));
+  };
+
+  pi.on("session_start", (_e, ctx) => syncYield(ctx.model?.id, ctx.mode));
+  pi.on("model_select", (e, ctx) => syncYield(e.model.id, ctx.mode));
 }
